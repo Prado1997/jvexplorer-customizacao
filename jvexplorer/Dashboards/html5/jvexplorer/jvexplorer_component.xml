@@ -1,0 +1,7 @@
+<gadget>
+  <level id="JVX" description="JVExplorer">
+    <container orientacao="V" tamanhoRelativo="100">
+      <html5component id="html5_jvx" entryPoint="main.jsp"/>
+    </container>
+  </level>
+</gadget>

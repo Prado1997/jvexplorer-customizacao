@@ -1,0 +1,364 @@
+plugins {
+    id 'java'
+    id 'org.jetbrains.kotlin.jvm' version '1.9.22'
+}
+group = 'br.com.sankhya.dstech'
+def skwVersion = "4.36"
+
+// Vamos forçar o java 8 aqui
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+// Garante que os arquivos Kotlin também sejam compilados para Java 1.8
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+    }
+}
+
+// Fontes .java em ISO-8859-1 (padrão Sankhya) — garante leitura correta em qualquer máquina
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'ISO-8859-1'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url = uri("https://maven.sankhya.com.br/repository/maven-public/")
+        allowInsecureProtocol = true
+    }
+    maven {
+        url = uri("https://maven.dstech.space/repository/maven-public/")
+        allowInsecureProtocol = true
+    }
+}
+
+dependencies {
+    // ADICIONADO: Biblioteca padrão do Kotlin, necessária para o código Kotlin funcionar.
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
+
+    implementation 'com.squareup.okhttp3:okhttp:3.9.0'
+    implementation 'org.json:json:20210307'
+    compileOnly 'javax.ejb:ejb-api:3.0'
+    compileOnly 'javax.servlet:servlet-api:2.3'
+
+    implementation "br.com.sankhya:jape:$skwVersion"
+    implementation "br.com.sankhya:mge-modelcore:$skwVersion"
+    implementation "br.com.sankhya:mgecom-model:$skwVersion"
+    implementation "br.com.sankhya:sanutil:$skwVersion"
+    implementation "br.com.sankhya:sanws:$skwVersion"
+    implementation "br.com.sankhya:mge-param:$skwVersion"
+    implementation 'br.com.sankhya:cuckoo:master'
+    implementation "br.com.sankhya:dwf:$skwVersion"
+    implementation "com.google.code.gson:gson:2.1"
+    implementation "jdom:jdom:1.0"
+    compileOnly 'log4j:log4j:1.2.17'
+
+
+    //Implementations de Módulos Extras
+    //implementation "br.com.sankhya:mgeprod-model:4.32.5"
+    //implementation "br.com.sankhya:mge-table:$skwVersion"
+    //implementation "br.com.sankhya:mgearmazem-model:$skwVersion"
+    //implementation "br.com.sankhya:mgecontab-model:5.2"
+    //implementation "br.com.sankhya:mgecot-model:$skwVersion"
+    //implementation "br.com.sankhya:mgectbz-model:5.2"
+    //implementation "br.com.sankhya:mgefin-model:$skwVersion"
+    //implementation "br.com.sankhya:mgeinv-model:$skwVersion"
+    //implementation "br.com.sankhya:mgepes-model:5.0"
+    //implementation "br.com.sankhya:mgeserv-model:$skwVersion"
+    //implementation "br.com.sankhya:mgewms-model:5.2"
+    //implementation "br.com.sankhya:sancrypt:$skwVersion"
+    //implementation "br.com.sankhya:mgeliv-model:5.2" // Modelo do Módulo Livros Fiscais.
+
+    //Trabalhar com arquivos xls
+    //implementation("org.apache.poi:poi:3.9")
+    //implementation("org.apache.poi:poi-ooxml:3.9")
+
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    implementation "net.sf.jasperreports:jasperreports:4.0.0"
+    implementation "commons-fileupload:commons-fileupload:1.5"
+
+    // para lib local
+    //implementation(file("path"))
+
+    //para poder usar Base64, Basic Auth, etc
+    implementation "commons-codec:commons-codec:1.17.1"
+    //para gerar arquivos temporários
+    implementation "commons-io:commons-io:2.16.1"
+
+    //extra
+    //compileOnly "br.com.sankhya:lombok-1.18.24:$skwVersion"
+    //annotationProcessor "br.com.sankhya:lombok-1.18.24:$skwVersion"
+
+    //testes
+    testImplementation platform("org.junit:junit-bom:5.9.1")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+}
+
+test {
+    useJUnitPlatform()
+}
+
+// ==================================================================
+// DECOMPILER: JAR do CFR embutido no ZIP do dashboard jvexplorer.
+// Nao entra no classpath de compilacao — o main.jsp o carrega em
+// runtime por URLClassLoader isolado.
+// ==================================================================
+
+configurations {
+    decompiler
+}
+
+dependencies {
+    decompiler 'org.benf:cfr:0.152'
+}
+
+// ==================================================================
+// ESTRUTURA: Cada pasta raiz (exceto build e dist) é uma demanda.
+// ==================================================================
+
+def excludedRootDirs = ['build', 'dist'] as Set
+
+// Agrega sources de todas as demandas encontradas na raiz
+sourceSets {
+    main {
+        java {
+            def dirs = []
+            rootDir.eachDir { dir ->
+                if (!dir.name.startsWith('.') && !excludedRootDirs.contains(dir.name)) {
+                    def javaDir = new File(dir, 'Java/src')
+                    if (javaDir.exists()) dirs << javaDir
+                }
+            }
+            srcDirs = dirs
+        }
+        kotlin {
+            def dirs = []
+            rootDir.eachDir { dir ->
+                if (!dir.name.startsWith('.') && !excludedRootDirs.contains(dir.name)) {
+                    def kotlinDir = new File(dir, 'Kotlin/src')
+                    if (kotlinDir.exists()) dirs << kotlinDir
+                }
+            }
+            srcDirs = dirs
+        }
+        resources {
+            // NÃO agregar resources de todas as demandas: caminhos iguais entre demandas
+            // (ex: sql/README.md) geram "duplicate entry" no processResources.
+            // Cada task gerar-jar-<demanda> injeta os resources da própria demanda.
+            srcDirs = []
+        }
+    }
+}
+
+// ==================================================================
+// LÓGICA DE GERAÇÃO AUTOMÁTICA DE TASKS
+// ==================================================================
+
+def packagePath = "br/com/sankhya/dstech"
+// Uma demanda válida tem Java/src/<packagePath>/<nomeDemanda>/
+Set<String> modulesToBuild = new HashSet<>()
+
+rootDir.eachDir { dir ->
+    if (!dir.name.startsWith('.') && !excludedRootDirs.contains(dir.name)) {
+        def demandPackageDir = new File(dir, "Java/src/${packagePath}/${dir.name}")
+        if (demandPackageDir.exists()) {
+            modulesToBuild.add(dir.name)
+        }
+    }
+}
+
+// Cria task Jar por demanda
+modulesToBuild.each { moduleName ->
+    tasks.register("gerar-jar-${moduleName}", Jar) {
+        group = moduleName
+        description = "Gerar Jar"
+        archiveBaseName.set("${moduleName}-${readVersion(moduleName)}")
+        destinationDirectory.set(file("dist"))
+
+        // Classes compiladas: shared (helper/utils) + apenas a demanda específica.
+        // Includes no escopo deste from para não filtrar os resources abaixo.
+        from(sourceSets.main.output) {
+            include 'br/com/sankhya/dstech/helper/**'
+            include 'br/com/sankhya/dstech/utils/**'
+            include "br/com/sankhya/dstech/${moduleName}/**"
+        }
+
+        // Resources: demanda específica (sql/, templates/) — sem filtro
+        def demandResources = file("${moduleName}/Java/resources")
+        if (demandResources.exists()) {
+            from(demandResources)
+        }
+
+        // Fontes da demanda (para referência dentro do JAR)
+        from(file("${moduleName}/Java/src")) { into 'src/java' }
+        def demandKotlinSrc = file("${moduleName}/Kotlin/src")
+        if (demandKotlinSrc.exists()) {
+            from(demandKotlinSrc) { into 'src/kotlin' }
+        }
+    }
+}
+
+// ==================================================================
+// GERAR ZIP HTML5 — varre Dashboards/html5/ de cada demanda
+// ==================================================================
+
+rootDir.eachDir { demandDir ->
+    if (!demandDir.name.startsWith('.') && !excludedRootDirs.contains(demandDir.name)) {
+        def html5Base = new File(demandDir, 'Dashboards/html5')
+        if (html5Base.exists()) {
+            html5Base.eachDir { dashDir ->
+                tasks.register("html5-${dashDir.name}", Zip) {
+                    group = "Gerar Zip HTML5"
+                    description = "Gera ZIP com conteúdo de ${dashDir.name}"
+                    archiveBaseName.set(dashDir.name)
+                    destinationDirectory.set(file("dist/Dashboards"))
+                    from(dashDir)
+                }
+            }
+        }
+    }
+}
+
+// O JVExplorer precisa do cfr.jar ao lado do main.jsp para descompilar.
+tasks.matching { it.name == 'html5-jvexplorer' }.configureEach {
+    from(configurations.decompiler) { into 'lib' }
+}
+
+// --- FUNÇÕES AUXILIARES ---
+
+/**
+ * Lê a versão específica de uma task/módulo.
+ * Se não existir no arquivo, retorna "1.0.0" por padrão.
+ */
+def readVersion(String moduleName) {
+    def properties = new Properties()
+    def versionFile = file("version.properties")
+
+    if (versionFile.exists()) {
+        versionFile.withInputStream { properties.load(it) }
+    }
+
+    return properties.getProperty(moduleName, "1.0.0")
+}
+
+/**
+ * Incrementa a versão de um módulo específico passado por parâmetro.
+ */
+def incrementVersion(String moduleName) {
+    def properties = new Properties()
+    def versionFile = file("version.properties")
+
+    if (versionFile.exists()) {
+        versionFile.withInputStream { properties.load(it) }
+    }
+
+    def version = properties.getProperty(moduleName, "1.0.0")
+    def (major, minor, patch) = version.tokenize('.')
+    patch = patch.toInteger() + 1
+    def newVersion = "${major}.${minor}.${patch}"
+
+    properties.setProperty(moduleName, newVersion)
+    versionFile.withOutputStream { properties.store(it, null) }
+
+    return newVersion
+}
+
+// ==================================================================
+// SCAFFOLDING — Cria nova demanda a partir do template
+// ==================================================================
+
+
+
+// Uso: ./gradlew criarDemanda -PnomeDemanda=minhademanda
+// ==================================================================
+
+tasks.register('criarDemanda') {
+    group = "DsTech - Utils"
+    description = "Cria nova demanda a partir do template. Uso: ./gradlew criarDemanda -PnomeDemanda=minhademanda"
+
+    doLast {
+        def nome = project.findProperty('nomeDemanda')?.toString()?.trim()
+
+        if (!nome) {
+            ant.input(message: "Nome da demanda:", addproperty: "nomeDemandaInput")
+            nome = ant.properties['nomeDemandaInput']?.toString()?.trim()
+        }
+
+        if (!nome) {
+            throw new GradleException("Nome da demanda não informado.")
+        }
+
+        // Normaliza para minúsculas — nome vira pacote Java (convenção: tudo minúsculo)
+        nome = nome.toLowerCase()
+
+        if (nome == 'nomedemanda') {
+            throw new GradleException("Nome inválido: não pode ser 'nomedemanda'.")
+        }
+
+        if (!(nome ==~ /[a-z][a-z0-9]*/)) {
+            throw new GradleException("Nome inválido: '${nome}'. Use apenas letras (a-z) e números, começando por letra — vira pacote Java.")
+        }
+
+        def destDir = file(nome)
+        if (destDir.exists()) {
+            throw new GradleException("Pasta '${nome}' já existe. Escolha outro nome.")
+        }
+
+        def templateDir = file('.template/nomedemanda')
+        def templatePath = templateDir.canonicalPath
+
+        templateDir.traverse { srcFile ->
+            def relativePath = srcFile.canonicalPath
+                .substring(templatePath.length() + 1)
+                .replace('nomedemanda', nome)
+
+            def destFile = new File(destDir, relativePath)
+
+            if (srcFile.isDirectory()) {
+                destFile.mkdirs()
+            } else {
+                destFile.parentFile?.mkdirs()
+                try {
+                    def content = srcFile.getText('UTF-8')
+                    destFile.setText(content.replace('nomedemanda', nome), 'UTF-8')
+                } catch (Exception ignored) {
+                    // arquivo binário — copia sem modificação
+                    destFile.bytes = srcFile.bytes
+                }
+            }
+        }
+
+        println ""
+        println "✅ Demanda '${nome}' criada em ./${nome}"
+        println "   Próximo passo: ./gradlew ${nome}"
+        println ""
+
+    }
+}
+
+/*
+  Para cada task 'jar-<demanda>', cria automaticamente 'inc-<demanda>'.
+  Ambas ficam agrupadas sob o nome da demanda.
+
+  Ex: 'gerar-jar-nomedemanda' → cria 'incrementar-versao-nomedemanda' no mesmo grupo.
+*/
+tasks.withType(Jar).all { jarTask ->
+    if (jarTask.name.startsWith('gerar-jar-') && modulesToBuild.contains(jarTask.name.substring(10))) {
+        def moduleName = jarTask.name.substring(10)
+
+        tasks.register("incrementar-versao-${moduleName}") {
+            group = moduleName
+            description = "Incrementar Versão"
+
+            doLast {
+                println "Incrementando versão para o módulo jar: ${moduleName}..."
+                def newVersion = incrementVersion(moduleName)
+                println "Nova versão de ${moduleName}: ${newVersion}"
+            }
+        }
+    }
+}
