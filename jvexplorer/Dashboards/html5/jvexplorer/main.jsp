@@ -110,7 +110,7 @@ private static byte[] lerBytes(File arquivo) throws IOException {
     try {
         byte[] buf = new byte[BUFFER];
         int lidos;
-        while ((lidos = in.read(buf)) > 0) bos.write(buf, 0, lidos);
+        while ((lidos = in.read(buf)) != -1) bos.write(buf, 0, lidos);
     } finally {
         in.close();
     }
@@ -137,9 +137,14 @@ private static File dirSessao(HttpSession sessao) {
     return new File(new File(System.getProperty("java.io.tmpdir"), "jvexplorer"), id);
 }
 
+/* Cada upload do ZIP no OM recompila o JSP num pacote novo
+   (html5component._<cod>_<timestamp>). O Estado gravado pela versao anterior tem
+   o mesmo nome simples e outra Class: castar direto lanca ClassCastException e
+   derruba todas as acoes ate a sessao expirar. Descarta o resto antigo e recomeca. */
 private static synchronized Estado estado(HttpSession sessao) {
-    Estado atual = (Estado) sessao.getAttribute(SESS);
-    if (atual != null) return atual;
+    Object gravado = sessao.getAttribute(SESS);
+    if (gravado instanceof Estado) return (Estado) gravado;
+    if (gravado != null) sessao.removeAttribute(SESS); // dispara valueUnbound: apaga o temp antigo
     Estado novo = new Estado();
     novo.dir = dirSessao(sessao);
     apagar(novo.dir);
@@ -173,7 +178,7 @@ private static void anexar(File destino, InputStream in, long jaGravado) throws 
     try {
         byte[] buf = new byte[BUFFER];
         int lidos;
-        while ((lidos = in.read(buf)) > 0) {
+        while ((lidos = in.read(buf)) != -1) {
             total += lidos;
             if (total > MAX_JAR) throw new IOException("O arquivo excede o limite de " + (MAX_JAR / 1048576L) + " MB.");
             out.write(buf, 0, lidos);
@@ -211,7 +216,7 @@ private static long copiarEntrada(JarFile jar, JarEntry entrada, File destino) t
     try {
         byte[] buf = new byte[BUFFER];
         int lidos;
-        while ((lidos = in.read(buf)) > 0) {
+        while ((lidos = in.read(buf)) != -1) {
             out.write(buf, 0, lidos);
             total += lidos;
         }
@@ -301,20 +306,22 @@ private static void indexar(Estado estado, List<String> nomes) {
 
 /* ------------------------------------------------------------------ CFR */
 
+private static void adicionarReal(ServletContext contexto, List<String> candidatos, String caminho) {
+    String real = contexto.getRealPath(caminho);
+    if (real != null && !candidatos.contains(real)) candidatos.add(real);
+}
+
 private static List<String> candidatosCfr(ServletContext contexto, HttpServletRequest requisicao) {
     List<String> candidatos = new ArrayList<String>();
     String propriedade = System.getProperty("jvexplorer.cfr.jar");
     if (propriedade != null && propriedade.trim().length() > 0) candidatos.add(propriedade.trim());
     String meuPath = requisicao.getServletPath();
-    if (meuPath != null && meuPath.lastIndexOf('/') > 0) {
-        String pasta = meuPath.substring(0, meuPath.lastIndexOf('/'));
-        String real = contexto.getRealPath(pasta + "/lib");
-        if (real != null) candidatos.add(real);
-        String realPasta = contexto.getRealPath(pasta);
-        if (realPasta != null) candidatos.add(realPasta);
-    }
-    String raiz = contexto.getRealPath("/dashboard");
-    if (raiz != null) candidatos.add(raiz);
+    // Pasta do proprio JSP: "" quando ele esta na raiz do contexto (lastIndexOf == 0).
+    String pasta = (meuPath == null || meuPath.lastIndexOf('/') < 0)
+                 ? "" : meuPath.substring(0, meuPath.lastIndexOf('/'));
+    adicionarReal(contexto, candidatos, pasta + "/lib");
+    adicionarReal(contexto, candidatos, pasta.length() == 0 ? "/" : pasta);
+    adicionarReal(contexto, candidatos, "/dashboard");
     candidatos.add(new File(System.getProperty("java.io.tmpdir"), "jvexplorer-lib").getAbsolutePath());
     return candidatos;
 }
@@ -452,7 +459,9 @@ String acao = request.getParameter("action");
 if (acao == null || acao.trim().length() == 0) {
     String query = request.getQueryString();
     String urlMge = request.getRequestURI() + (query == null ? "" : "?" + query);
-    String urlJsp = request.getServletPath();
+    // getServletPath() e relativo ao contexto: sem o contextPath o browser resolveria
+    // a rota alternativa contra a raiz do host (/main.jsp em vez de /mge/main.jsp).
+    String urlJsp = request.getContextPath() + request.getServletPath();
 %>
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -491,7 +500,40 @@ if (acao == null || acao.trim().length() == 0) {
   --c-num:#8CBDE0;
   --c-type:#7FC6CE;
   --c-fn:#C8CEDC;
+  --veil:rgba(6,8,12,.66);
   --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+}
+
+/* Tema claro: aplicado por data-theme no <html>. O escuro segue sendo o padrao. */
+:root[data-theme="light"]{
+  --ground:#F4F5F8;
+  --surface:#FFFFFF;
+  --surface-2:#EEF0F5;
+  --line:#DCDFE7;
+  --line-soft:#E8EAF0;
+  --ink:#191C23;
+  --ink-2:#4A5162;
+  --ink-3:#7A8296;
+  --accent:#B45A12;
+  --accent-ink:#8A4409;
+  --accent-wash:#F6E7D6;
+  --ok:#2C6F4F;
+  --ok-wash:#DCEDE3;
+  --crit:#A82920;
+  --crit-wash:#F7E2E0;
+  --info:#255E8C;
+  --info-wash:#DEE9F3;
+  --gutter:#A6AEBF;
+  --sel:#F0E2D2;
+  --c-comment:#7B8494;
+  --c-string:#2C6F4F;
+  --c-key:#9C3A8C;
+  --c-anno:#B45A12;
+  --c-num:#255E8C;
+  --c-type:#1F5C6B;
+  --c-fn:#3B4252;
+  --veil:rgba(30,34,44,.38);
+  --shadow:0 1px 2px rgba(20,22,27,.07), 0 8px 24px rgba(20,22,27,.06);
 }
 
 *{box-sizing:border-box}
@@ -542,6 +584,8 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .chip.ro{color:var(--accent-ink);border-color:var(--accent);background:var(--accent-wash)}
 .chip.act{cursor:pointer}
 .chip.act:hover{border-color:var(--ink-3)}
+.chip.act svg{width:13px;height:13px;flex:none}
+#btn-tema{padding:4px 7px}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:none}
 .dot.off{background:var(--crit)}
 
@@ -714,7 +758,7 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
 .status .right{margin-left:auto;display:flex;gap:14px;flex:none;overflow:visible}
 
 /* ---------- modal ---------- */
-.overlay{position:fixed;inset:0;background:rgba(6,8,12,.66);display:grid;place-items:center;padding:24px;z-index:50}
+.overlay{position:fixed;inset:0;background:var(--veil);display:grid;place-items:center;padding:24px;z-index:50}
 .overlay[hidden]{display:none}
 .modal{
   background:var(--surface);border:1px solid var(--line);border-radius:12px;
@@ -761,6 +805,16 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
+<script>
+/* Aplica o tema salvo antes do primeiro paint para nao piscar a cor errada.
+   O gadget roda em iframe do OM: storage pode lancar em contexto restrito. */
+(function () {
+  try {
+    var salvo = window.localStorage.getItem('jvexplorer.tema');
+    if (salvo === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  } catch (e) { /* storage indisponivel: mantem o tema escuro */ }
+})();
+</script>
 </head>
 <body>
 
@@ -776,6 +830,9 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
     <div class="top-right">
       <span class="chip ro" title="O JVExplorer nunca grava no banco: o JAR vive so na sua sessao">Somente leitura</span>
       <button class="chip act" id="btn-info"><span class="dot" id="dot-cfr"></span>Diagnostico</button>
+      <button class="chip act" id="btn-tema" type="button" aria-pressed="false">
+        <svg id="ico-tema" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"></svg>
+      </button>
     </div>
   </header>
 
@@ -1023,9 +1080,17 @@ function erro(msg) {
   mostrarAviso('<b>Falha</b>' + esc(msg));
 }
 
+/* Reexibido apos cada upload: o aviso do CFR e permanente enquanto o jar nao for achado. */
+function avisoCfr() {
+  if (S.cfr) { $('aviso').hidden = true; return; }
+  mostrarAviso('<b>Descompilador ausente</b>Nenhum <code>cfr*.jar</code> foi encontrado no servidor. ' +
+    'Fontes e recursos embutidos no jar continuam abrindo; classes sem fonte nao. ' +
+    'Veja <b>Diagnostico</b>.');
+}
+
 async function enviarJar(arquivo) {
   if (!/\.(jar|zip)$/i.test(arquivo.name)) { erro('Selecione um arquivo .jar.'); return; }
-  $('aviso').hidden = S.cfr;
+  $('aviso').hidden = true;
   var partes = Math.max(1, Math.ceil(arquivo.size / CHUNK));
   var resposta = null;
   try {
@@ -1046,6 +1111,7 @@ async function enviarJar(arquivo) {
   }
   esconderProgresso();
   aplicarJar(resposta);
+  avisoCfr();
 }
 
 function aplicarJar(resposta) {
@@ -1450,11 +1516,7 @@ async function carregarEnv() {
     S.env = env;
     $('dot-cfr').className = 'dot' + (S.cfr ? '' : ' off');
     $('btn-info').title = S.cfr ? 'CFR pronto: ' + env.cfr.caminho : 'CFR nao encontrado';
-    if (!S.cfr) {
-      mostrarAviso('<b>Descompilador ausente</b>Nenhum <code>cfr*.jar</code> foi encontrado no servidor. ' +
-        'Fontes e recursos embutidos no jar continuam abrindo; classes sem fonte nao. ' +
-        'Veja <b>Diagnostico</b>.');
-    }
+    avisoCfr();
   } catch (e) {
     $('dot-cfr').className = 'dot off';
     mostrarAviso('<b>Sem comunicacao com o servidor</b>' + esc(e.message));
@@ -1491,6 +1553,43 @@ function ligarBusca() {
   });
 }
 
+/* ---------------- tema ---------------- */
+var TEMA_KEY = 'jvexplorer.tema';
+var TEMA_CLARO = 'light';
+var TEMA_ESCURO = 'dark';
+
+var ICO_LUA = '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5Z"/>';
+var ICO_SOL = '<circle cx="12" cy="12" r="4"/>' +
+  '<path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/>';
+
+function temaAtual() {
+  return document.documentElement.getAttribute('data-theme') === TEMA_CLARO ? TEMA_CLARO : TEMA_ESCURO;
+}
+
+function aplicarTema(tema) {
+  var claro = tema === TEMA_CLARO;
+  var raiz = document.documentElement;
+
+  if (claro) raiz.setAttribute('data-theme', TEMA_CLARO);
+  else raiz.removeAttribute('data-theme');
+
+  var botao = $('btn-tema');
+  botao.setAttribute('aria-pressed', claro ? 'true' : 'false');
+  botao.setAttribute('aria-label', claro ? 'Ativar modo escuro' : 'Ativar modo claro');
+  botao.title = claro ? 'Modo claro ativo - clique para o escuro' : 'Modo escuro ativo - clique para o claro';
+  $('ico-tema').innerHTML = claro ? ICO_SOL : ICO_LUA;
+
+  try { window.localStorage.setItem(TEMA_KEY, claro ? TEMA_CLARO : TEMA_ESCURO); }
+  catch (e) { /* storage indisponivel: tema vale so para esta sessao */ }
+}
+
+function ligarTema() {
+  aplicarTema(temaAtual());
+  $('btn-tema').onclick = function () {
+    aplicarTema(temaAtual() === TEMA_CLARO ? TEMA_ESCURO : TEMA_CLARO);
+  };
+}
+
 function ligarModal() {
   $('btn-info').onclick = function () {
     $('modal-body').innerHTML = S.env ? htmlDiagnostico(S.env)
@@ -1513,6 +1612,7 @@ function ocultarBarraSankhya() {
 
 function init() {
   ocultarBarraSankhya();
+  ligarTema();
   ligarDropzone();
   ligarBusca();
   ligarModal();
@@ -1562,7 +1662,7 @@ try {
     } else if ("probe".equals(acao)) {
         InputStream corpo = request.getInputStream();
         byte[] descarte = new byte[BUFFER];
-        while (corpo.read(descarte) > 0) { /* consome e descarta */ }
+        while (corpo.read(descarte) != -1) { /* consome e descarta */ }
         out.print("{\"success\":true,\"probe\":true}");
 
     } else if ("reset".equals(acao)) {
