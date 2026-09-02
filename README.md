@@ -38,7 +38,7 @@ Funcionalidades JAVASCRIPT
 
 | Nome | Descrição |
 | --- | --- |
-| JVExplorer | Componente HTML5 de consulta: carrega um .jar, descompila e navega em pacotes e classes. Sem persistência em banco. Ver `jvexplorer/Documentacao/deploy-jvexplorer.md` |
+| JVExplorer | Componente HTML5 de consulta: escolhe um JAR nos Módulos Java da base (TSIMOD/TSIJAR, só SUP) ou por upload, descompila e navega em pacotes e classes. Só leitura, sem escrita em banco. Ver `jvexplorer/Documentacao/deploy-jvexplorer.md` |
 
 ## Relatórios
 

@@ -3,10 +3,13 @@
 <%@ page import="java.net.*"%>
 <%@ page import="java.nio.*"%>
 <%@ page import="java.nio.charset.*"%>
+<%@ page import="java.sql.*"%>
 <%@ page import="java.util.*"%>
 <%@ page import="java.util.jar.*"%>
+<%@ page import="javax.naming.*"%>
 <%@ page import="javax.servlet.*"%>
 <%@ page import="javax.servlet.http.*"%>
+<%@ page import="javax.sql.*"%>
 <%!
 /* =====================================================================
    JVExplorer - visualizador de fontes de JAR (somente leitura)
@@ -52,6 +55,9 @@ public static final class Estado implements HttpSessionBindingListener {
     File saida;
     File parcial;
     String nomeJar = "";
+    String rotulo = "";
+    int codModulo;
+    int codJar;
     long tamanhoJar;
     int qtdClasses;
     int qtdEntradas;
@@ -165,9 +171,358 @@ private static void limpar(Estado estado) {
     estado.indice.clear();
     estado.cache.clear();
     estado.nomeJar = "";
+    estado.rotulo = "";
+    estado.codModulo = 0;
+    estado.codJar = 0;
     estado.tamanhoJar = 0;
     estado.qtdClasses = 0;
     estado.qtdEntradas = 0;
+}
+
+/* ---------------------------------------------------------------- banco */
+
+/* O JSP nao importa classes Sankhya: um pacote fora de lugar impediria a
+   compilacao e derrubaria a tela inteira, inclusive o upload manual. O acesso
+   ao banco vai todo por reflection sobre o JAPE, com fallback de DataSource
+   por JNDI. Quando nada resolve, so o modo de upload continua disponivel. */
+private static final String[] DS_JNDI = {
+    "java:/jdbc/sankhyaDS", "java:jboss/datasources/SankhyaDS",
+    "java:/SankhyaDS", "java:/jdbc/SankhyaDS", "jdbc/sankhyaDS" };
+
+private static final String SQL_MODULOS =
+    "SELECT M.CODMODULO, M.DESCRMODULO, M.RESOURCEID,"
+  + " (SELECT COUNT(1) FROM TSIJAR J WHERE J.CODMODULO = M.CODMODULO) QTDJAR"
+  + " FROM TSIMOD M"
+  + " WHERE UPPER(M.DESCRMODULO) LIKE ? ESCAPE '\\' OR UPPER(M.RESOURCEID) LIKE ? ESCAPE '\\'"
+  + " ORDER BY M.DESCRMODULO";
+
+private static final String SQL_JAR =
+    "SELECT M.DESCRMODULO, J.DESCRICAO, J.ARQUIVO"
+  + " FROM TSIJAR J INNER JOIN TSIMOD M ON M.CODMODULO = J.CODMODULO"
+  + " WHERE J.CODMODULO = ? AND J.CODJAR = ?";
+
+private static volatile String origemBanco = "";
+
+public static final class Conexao {
+    Connection conn;
+    Object jdbc;
+    Object handle;
+    Class<?> jape;
+    String origem = "";
+    boolean oracle;
+}
+
+private static String descrever(Throwable falha) {
+    if (falha == null) return "sem detalhe";
+    String mensagem = falha.getMessage();
+    return mensagem == null || mensagem.length() == 0 ? falha.getClass().getName() : mensagem;
+}
+
+/* Ler TSIJAR expoe o fonte de tudo que esta instalado: so o SUP consulta a base. */
+private static Class<?> classeAuth() throws ClassNotFoundException {
+    return Thread.currentThread().getContextClassLoader()
+        .loadClass("br.com.sankhya.modelcore.auth.AuthenticationInfo");
+}
+
+/* getCurrent() lanca AuthenticationException quando o ThreadLocal esta vazio, e
+   ele so e populado por AuthenticationServiceContext.setup nos filtros de
+   servico - a thread que serve este JSP frequentemente nao passa por lah. */
+private static Object autenticacaoDaThread() {
+    try {
+        return classeAuth().getMethod("getCurrentOrNull").invoke(null);
+    } catch (Throwable semThreadLocal) {
+        return null;
+    }
+}
+
+private static Object autenticacaoDaSessao(HttpSession sessao, StringBuilder onde) {
+    Class<?> auth;
+    try {
+        auth = classeAuth();
+    } catch (Throwable semClasse) {
+        return null;
+    }
+    Enumeration<String> nomes = sessao.getAttributeNames();
+    while (nomes.hasMoreElements()) {
+        String nome = nomes.nextElement();
+        Object valor = sessao.getAttribute(nome);
+        if (!auth.isInstance(valor)) continue;
+        onde.setLength(0);
+        onde.append("httpsession:").append(nome);
+        return valor;
+    }
+    return null;
+}
+
+private static Object autenticacao(HttpSession sessao, StringBuilder onde) {
+    Object atual = autenticacaoDaThread();
+    if (atual != null) {
+        onde.setLength(0);
+        onde.append("threadlocal");
+        return atual;
+    }
+    return autenticacaoDaSessao(sessao, onde);
+}
+
+private static boolean ehSup(HttpSession sessao) {
+    StringBuilder onde = new StringBuilder();
+    Object atual = autenticacao(sessao, onde);
+    if (atual == null) return false;
+    try {
+        return Boolean.TRUE.equals(atual.getClass().getMethod("isSUP").invoke(atual));
+    } catch (Throwable semIsSup) {
+        return false;
+    }
+}
+
+private static final String AVISO_SUP =
+    "Verificar modulos da base e permitido somente para o usuario SUP.";
+
+private static void exigirSup(HttpSession sessao) throws IOException {
+    if (ehSup(sessao)) return;
+    throw new IOException(AVISO_SUP + " Use o upload manual do jar.");
+}
+
+private static void montarJape(Conexao conexao, ClassLoader loader) throws Exception {
+    conexao.jape = loader.loadClass("br.com.sankhya.jape.core.JapeSession");
+    conexao.handle = conexao.jape.getMethod("open").invoke(null);
+    Object facade = loader.loadClass("br.com.sankhya.modelcore.util.EntityFacadeFactory")
+                          .getMethod("getDWFFacade").invoke(null);
+    conexao.jdbc = loader.loadClass("br.com.sankhya.jape.EntityFacade")
+                         .getMethod("getJdbcWrapper").invoke(facade);
+    Class<?> wrapper = loader.loadClass("br.com.sankhya.jape.dao.JdbcWrapper");
+    wrapper.getMethod("openSession").invoke(conexao.jdbc);
+    conexao.conn = (Connection) wrapper.getMethod("getConnection").invoke(conexao.jdbc);
+    conexao.origem = "JAPE " + wrapper.getMethod("getDSJndiName").invoke(conexao.jdbc);
+}
+
+private static Conexao porJape() throws Exception {
+    Conexao conexao = new Conexao();
+    try {
+        montarJape(conexao, Thread.currentThread().getContextClassLoader());
+        return conexao;
+    } catch (Exception semJape) {
+        fechar(conexao);
+        throw semJape;
+    }
+}
+
+private static Conexao porJndi(String nome) throws Exception {
+    Conexao conexao = new Conexao();
+    DataSource fonte = (DataSource) new InitialContext().lookup(nome);
+    conexao.conn = fonte.getConnection();
+    conexao.origem = "JNDI " + nome;
+    return conexao;
+}
+
+private static Conexao porCandidatos() throws Exception {
+    Throwable ultimo = null;
+    try {
+        return porJape();
+    } catch (Throwable semJape) {
+        ultimo = semJape;
+    }
+    for (int i = 0; i < DS_JNDI.length; i++) {
+        try { return porJndi(DS_JNDI[i]); } catch (Throwable naoResolveu) { ultimo = naoResolveu; }
+    }
+    throw new IOException("Sem conexao com o banco: " + descrever(ultimo));
+}
+
+private static Conexao abrirConexao() throws Exception {
+    String forcado = System.getProperty("jvexplorer.ds");
+    Conexao conexao = (forcado == null || forcado.trim().length() == 0)
+                    ? porCandidatos() : porJndi(forcado.trim());
+    try {
+        String vendor = conexao.conn.getMetaData().getDatabaseProductName();
+        conexao.oracle = vendor != null && vendor.toUpperCase(Locale.ENGLISH).indexOf("ORACLE") >= 0;
+    } catch (SQLException semMetadados) {
+        fechar(conexao);
+        throw semMetadados;
+    }
+    origemBanco = conexao.origem;
+    return conexao;
+}
+
+private static void fechar(Conexao conexao) {
+    if (conexao == null) return;
+    try {
+        /* closeSession devolve a conexao ao pool do JAPE; fora dele o close e nosso. */
+        if (conexao.jdbc != null) conexao.jdbc.getClass().getMethod("closeSession").invoke(conexao.jdbc);
+        else if (conexao.conn != null) conexao.conn.close();
+    } catch (Throwable ignorado) { }
+    try {
+        if (conexao.handle != null) {
+            conexao.jape.getMethod("close", conexao.handle.getClass()).invoke(null, conexao.handle);
+        }
+    } catch (Throwable ignorado) { }
+}
+
+private static void encerrar(ResultSet rs, Statement comando, Conexao conexao) {
+    try { if (rs != null) rs.close(); } catch (SQLException ignorado) { }
+    try { if (comando != null) comando.close(); } catch (SQLException ignorado) { }
+    fechar(conexao);
+}
+
+/* LIKE com curingas do usuario escapados: '_' solto casaria pacotes demais. */
+private static String curinga(String termo) {
+    String limpo = termo == null ? "" : termo.trim().toUpperCase(Locale.ENGLISH);
+    limpo = limpo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+    return "%" + limpo + "%";
+}
+
+private static int inteiro(String valor) throws IOException {
+    try {
+        return Integer.parseInt(valor.trim());
+    } catch (RuntimeException invalido) {
+        throw new IOException("Parametro numerico invalido: " + valor);
+    }
+}
+
+private static String sqlJars(boolean oracle) {
+    return "SELECT J.CODJAR, J.DESCRICAO, "
+         + (oracle ? "DBMS_LOB.GETLENGTH(J.ARQUIVO)" : "DATALENGTH(J.ARQUIVO)")
+         + " TAMANHO FROM TSIJAR J WHERE J.CODMODULO = ? ORDER BY J.CODJAR";
+}
+
+private static void linhaModulo(StringBuilder sb, ResultSet rs) throws SQLException {
+    sb.append("{\"cod\":").append(rs.getInt("CODMODULO"))
+      .append(",\"descr\":\"").append(escapeJson(rs.getString("DESCRMODULO")))
+      .append("\",\"pacote\":\"").append(escapeJson(rs.getString("RESOURCEID")))
+      .append("\",\"jars\":").append(rs.getInt("QTDJAR")).append('}');
+}
+
+private static String jsonModulos(String termo) throws Exception {
+    StringBuilder sb = new StringBuilder(512).append("{\"success\":true,\"modulos\":[");
+    Conexao conexao = abrirConexao();
+    PreparedStatement comando = null;
+    ResultSet rs = null;
+    try {
+        comando = conexao.conn.prepareStatement(SQL_MODULOS);
+        comando.setString(1, curinga(termo));
+        comando.setString(2, curinga(termo));
+        rs = comando.executeQuery();
+        for (int i = 0; rs.next(); i++) {
+            if (i > 0) sb.append(',');
+            linhaModulo(sb, rs);
+        }
+    } finally {
+        encerrar(rs, comando, conexao);
+    }
+    return sb.append("]}").toString();
+}
+
+private static String jsonJars(int codModulo) throws Exception {
+    StringBuilder sb = new StringBuilder(256).append("{\"success\":true,\"jars\":[");
+    Conexao conexao = abrirConexao();
+    PreparedStatement comando = null;
+    ResultSet rs = null;
+    try {
+        comando = conexao.conn.prepareStatement(sqlJars(conexao.oracle));
+        comando.setInt(1, codModulo);
+        rs = comando.executeQuery();
+        for (int i = 0; rs.next(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append("{\"cod\":").append(rs.getInt("CODJAR"))
+              .append(",\"descricao\":\"").append(escapeJson(rs.getString("DESCRICAO")))
+              .append("\",\"tamanho\":").append(rs.getLong("TAMANHO")).append('}');
+        }
+    } finally {
+        encerrar(rs, comando, conexao);
+    }
+    return sb.append("]}").toString();
+}
+
+private static String testarConexao() {
+    if (origemBanco.length() > 0) return origemBanco;
+    Conexao conexao = null;
+    try {
+        conexao = abrirConexao();
+        return conexao.origem;
+    } catch (Throwable falha) {
+        return "falhou: " + descrever(falha);
+    } finally {
+        fechar(conexao);
+    }
+}
+
+private static String usuarioDe(Object autenticacao) {
+    if (autenticacao == null) return "";
+    try {
+        return "CODUSU " + autenticacao.getClass().getMethod("getUserID").invoke(autenticacao);
+    } catch (Throwable semUsuario) {
+        return autenticacao.getClass().getName();
+    }
+}
+
+/* Listado no Diagnostico para explicar um SUP que o JSP nao consegue reconhecer. */
+private static String jsonAtributosSessao(HttpSession sessao) {
+    StringBuilder sb = new StringBuilder(256).append('[');
+    Enumeration<String> nomes = sessao.getAttributeNames();
+    boolean primeiro = true;
+    while (nomes.hasMoreElements()) {
+        String nome = nomes.nextElement();
+        Object valor = sessao.getAttribute(nome);
+        if (!primeiro) sb.append(',');
+        primeiro = false;
+        sb.append('"').append(escapeJson(nome)).append(" = ")
+          .append(escapeJson(valor == null ? "null" : valor.getClass().getName())).append('"');
+    }
+    return sb.append(']').toString();
+}
+
+private static String jsonBanco(HttpSession sessao) {
+    StringBuilder onde = new StringBuilder("ausente");
+    Object atual = autenticacao(sessao, onde);
+    boolean sup = ehSup(sessao);
+    return new StringBuilder(256)
+        .append("{\"sup\":").append(sup)
+        .append(",\"auth\":\"").append(escapeJson(onde.toString()))
+        .append("\",\"usuario\":\"").append(escapeJson(usuarioDe(atual)))
+        .append("\",\"conexao\":\"").append(escapeJson(sup ? testarConexao() : ""))
+        .append("\",\"sessao\":").append(jsonAtributosSessao(sessao))
+        .append('}').toString();
+}
+
+private static String nomeJarDe(String descricao, int codModulo, int codJar) {
+    String base = descricao == null ? "" : nomeSimples(descricao.replace('\\', '/')).trim();
+    if (base.length() == 0) return "modulo" + codModulo + "-jar" + codJar + ".jar";
+    return base.toLowerCase(Locale.ENGLISH).endsWith(".jar") ? base : base + ".jar";
+}
+
+/* Grava o BLOB no arquivo parcial da sessao, reaproveitando o teto do upload. */
+private static void baixarJar(Estado estado, int codModulo, int codJar) throws Exception {
+    Conexao conexao = abrirConexao();
+    PreparedStatement comando = null;
+    ResultSet rs = null;
+    try {
+        comando = conexao.conn.prepareStatement(SQL_JAR);
+        comando.setInt(1, codModulo);
+        comando.setInt(2, codJar);
+        rs = comando.executeQuery();
+        if (!rs.next()) throw new IOException("Jar " + codJar + " do modulo " + codModulo + " nao existe na base.");
+        String descricao = rs.getString("DESCRICAO");
+        estado.rotulo = rs.getString("DESCRMODULO") + " / " + descricao;
+        estado.nomeJar = nomeJarDe(descricao, codModulo, codJar);
+        estado.codModulo = codModulo;
+        estado.codJar = codJar;
+        InputStream in = rs.getBinaryStream("ARQUIVO");
+        if (in == null) throw new IOException("O jar esta cadastrado sem conteudo (TSIJAR.ARQUIVO nulo).");
+        try { anexar(estado.parcial, in, 0L); } finally { in.close(); }
+    } finally {
+        encerrar(rs, comando, conexao);
+    }
+}
+
+private static void abrirDaBase(Estado estado, int codModulo, int codJar) throws Exception {
+    limpar(estado);
+    estado.dir.mkdirs();
+    baixarJar(estado, codModulo, codJar);
+    validarAssinatura(estado.parcial);
+    if (!estado.parcial.renameTo(estado.jar)) {
+        throw new IOException("Nao foi possivel gravar o jar no diretorio temporario da sessao.");
+    }
+    estado.tamanhoJar = estado.jar.length();
+    indexar(estado, extrairTudo(estado));
 }
 
 /* --------------------------------------------------------------- upload */
@@ -441,7 +796,10 @@ private static String jsonItens(Estado estado) {
 
 private static String jsonJar(Estado estado) {
     return new StringBuilder("{\"nome\":\"").append(escapeJson(estado.nomeJar))
-        .append("\",\"tamanho\":").append(estado.tamanhoJar)
+        .append("\",\"rotulo\":\"").append(escapeJson(estado.rotulo))
+        .append("\",\"codModulo\":").append(estado.codModulo)
+        .append(",\"codJar\":").append(estado.codJar)
+        .append(",\"tamanho\":").append(estado.tamanhoJar)
         .append(",\"classes\":").append(estado.qtdClasses)
         .append(",\"entradas\":").append(estado.qtdEntradas)
         .append(",\"itens\":").append(estado.indice.size())
@@ -546,6 +904,8 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+/* .drop e .seg tem display proprio: sem isto o atributo hidden nao esconderia. */
+[hidden]{display:none!important}
 :focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-radius:3px}
 
 .app{height:100dvh;display:grid;grid-template-rows:auto 1fr auto}
@@ -618,6 +978,56 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .drop span{font-size:11.5px}
 .drop small{font-size:10.5px;line-height:1.5;color:var(--ink-3);max-width:210px}
 .lnk{color:var(--accent-ink);text-decoration:underline;cursor:pointer}
+
+/* ---------- origem do jar: base x upload ---------- */
+.seg{
+  display:flex;gap:4px;padding:3px;margin-bottom:10px;
+  border:1px solid var(--line);border-radius:9px;background:var(--surface-2);
+}
+.segb{flex:1;font-size:11.5px;padding:5px 6px;border-radius:6px;color:var(--ink-3)}
+.segb.on{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.segb:disabled{opacity:.45;cursor:not-allowed}
+
+.minisearch{position:relative;display:flex;align-items:center;margin-bottom:8px}
+.minisearch input{
+  width:100%;min-width:0;padding:6px 9px;border-radius:7px;font:inherit;font-size:12px;
+  border:1px solid var(--line);background:var(--surface-2);color:var(--ink);
+}
+.minisearch input::placeholder{color:var(--ink-3)}
+
+.modlist{display:grid;gap:5px}
+.modrow{
+  display:block;width:100%;text-align:left;padding:7px 9px;
+  border:1px solid var(--line);border-radius:9px;background:var(--ground);
+}
+.modrow:hover{border-color:var(--ink-3)}
+.modrow.on{border-color:var(--accent)}
+.modrow .dsc{font-size:12px;color:var(--ink);line-height:1.35;word-break:break-word}
+.modrow .pkg{
+  font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--ink-3);word-break:break-all;
+}
+.modrow .qt{
+  float:right;margin-left:6px;padding:0 5px;font-family:"JetBrains Mono",monospace;font-size:10px;
+  color:var(--ink-3);border:1px solid var(--line);border-radius:20px;
+}
+.jarlist{display:grid;gap:4px;margin:5px 0 2px 8px;padding-left:8px;border-left:1px solid var(--line)}
+.jarrow{
+  display:flex;align-items:center;gap:6px;width:100%;text-align:left;padding:5px 8px;
+  border:1px solid var(--line-soft);border-radius:7px;background:var(--surface);
+  font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--ink-2);
+}
+.jarrow:hover{border-color:var(--ink-3);color:var(--ink)}
+.jarrow.on{border-color:var(--accent);background:var(--accent-wash);color:var(--accent-ink)}
+.jarrow .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jarrow .tam{margin-left:auto;flex:none;font-size:10px;color:var(--ink-3)}
+.jarlist .empty,.modlist .empty{padding:7px 2px;text-align:left;font-size:11.5px}
+.permaviso{
+  display:flex;align-items:flex-start;gap:6px;margin:0 0 10px;padding:7px 9px;
+  border:1px solid var(--line);border-radius:9px;background:var(--surface-2);
+  font-size:11.5px;line-height:1.45;color:var(--ink-2);
+}
+.permaviso b{flex:none;color:var(--accent-ink);font-weight:600}
+.jarcard .orig{margin-top:4px;font-size:11px;line-height:1.4;color:var(--ink-3)}
 
 .jarcard{
   margin-top:12px;border:1px solid var(--line);border-radius:10px;background:var(--ground);
@@ -842,7 +1252,22 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
       <div class="pane-head">Arquivo <span class="count" id="jar-count"></span></div>
       <div class="scroll">
         <div class="jarpane">
-          <div class="drop" id="drop">
+          <div class="seg" id="seg">
+            <button class="segb on" type="button" data-origem="base" id="seg-base">Modulos da base</button>
+            <button class="segb" type="button" data-origem="upload" id="seg-upload">Upload</button>
+          </div>
+
+          <p class="permaviso" id="perm-aviso" hidden></p>
+
+          <div id="origem-base">
+            <div class="minisearch">
+              <input id="q-mod" type="search" placeholder="Buscar modulo por nome ou pacote..."
+                     autocomplete="off" spellcheck="false">
+            </div>
+            <div class="modlist" id="modlist"></div>
+          </div>
+
+          <div class="drop" id="drop" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0L8 8m4-4 4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
             <b>Solte o .jar aqui</b>
             <span>ou <label class="lnk" for="file">selecione o arquivo</label></span>
@@ -907,6 +1332,8 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
    ============================================================ */
 
 var API_BASES = ["<%= escapeJson(urlMge) %>", "<%= escapeJson(urlJsp) %>"];
+/* Mesma frase do servidor: a regra de permissao vive no JSP, nao no cliente. */
+var AVISO_SUP = "<%= escapeJson(AVISO_SUP) %>";
 var CHUNK = 4 * 1024 * 1024;
 var MAX_ABAS = 10;
 
@@ -919,7 +1346,13 @@ var S = {
   ativo: null,
   colapsados: {},
   busca: '',
-  cfr: false
+  cfr: false,
+  sup: false,
+  origem: 'base',
+  modulos: [],
+  jars: {},
+  modAberto: null,
+  timerMod: null
 };
 
 var $ = function (id) { return document.getElementById(id); };
@@ -1088,6 +1521,114 @@ function avisoCfr() {
     'Veja <b>Diagnostico</b>.');
 }
 
+/* ---------------- modulos java da base ---------------- */
+function trocarOrigem(origem) {
+  if (origem === 'base' && !S.sup) return;
+  S.origem = origem;
+  $('seg-base').classList.toggle('on', origem === 'base');
+  $('seg-upload').classList.toggle('on', origem === 'upload');
+  $('origem-base').hidden = origem !== 'base';
+  $('drop').hidden = origem !== 'upload';
+}
+
+function agendarBuscaModulos() {
+  clearTimeout(S.timerMod);
+  S.timerMod = setTimeout(buscarModulos, 300);
+}
+
+async function buscarModulos() {
+  $('modlist').innerHTML = '<div class="empty">buscando modulos...</div>';
+  try {
+    var dados = await chamar('modulos', { q: $('q-mod').value.trim() });
+    S.modulos = dados.modulos;
+    renderModulos();
+  } catch (e) {
+    $('modlist').innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
+  }
+}
+
+function htmlJars(codModulo) {
+  var jars = S.jars[codModulo];
+  if (!jars) return '<div class="empty">carregando jars...</div>';
+  if (!jars.length) return '<div class="empty">Modulo sem jar cadastrado.</div>';
+  var html = '';
+  for (var i = 0; i < jars.length; i++) {
+    var ativo = S.jar && S.jar.codModulo === codModulo && S.jar.codJar === jars[i].cod;
+    html += '<button class="jarrow' + (ativo ? ' on' : '') + '" type="button" data-mod="' + codModulo +
+      '" data-jar="' + jars[i].cod + '" title="' + esc(jars[i].descricao) + '">' +
+      '<span class="nm">' + esc(jars[i].descricao) + '</span>' +
+      '<span class="tam">' + fmtBytes(jars[i].tamanho) + '</span></button>';
+  }
+  return html;
+}
+
+function htmlModulo(mod) {
+  var aberto = S.modAberto === mod.cod;
+  return '<div>' +
+    '<button class="modrow' + (aberto ? ' on' : '') + '" type="button" data-mod="' + mod.cod + '">' +
+      '<span class="qt">' + mod.jars + (mod.jars === 1 ? ' jar' : ' jars') + '</span>' +
+      '<span class="dsc">' + esc(mod.descr) + '</span>' +
+      '<span class="pkg">' + esc(mod.pacote) + '</span>' +
+    '</button>' +
+    (aberto ? '<div class="jarlist">' + htmlJars(mod.cod) + '</div>' : '') +
+  '</div>';
+}
+
+function renderModulos() {
+  if (!S.modulos.length) {
+    $('modlist').innerHTML = '<div class="empty">Nenhum modulo java encontrado.</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < S.modulos.length; i++) html += htmlModulo(S.modulos[i]);
+  $('modlist').innerHTML = html;
+  ligarModulos();
+}
+
+function ligarModulos() {
+  var mods = $('modlist').querySelectorAll('.modrow');
+  for (var i = 0; i < mods.length; i++) {
+    mods[i].onclick = function () { alternarModulo(Number(this.dataset.mod)); };
+  }
+  var jars = $('modlist').querySelectorAll('.jarrow');
+  for (var j = 0; j < jars.length; j++) {
+    jars[j].onclick = function () {
+      abrirDaBase(Number(this.dataset.mod), Number(this.dataset.jar));
+    };
+  }
+}
+
+async function alternarModulo(codModulo) {
+  S.modAberto = S.modAberto === codModulo ? null : codModulo;
+  renderModulos();
+  if (S.modAberto === null || S.jars[codModulo]) return;
+  try {
+    var dados = await chamar('jars', { mod: codModulo });
+    S.jars[codModulo] = dados.jars;
+  } catch (e) {
+    S.jars[codModulo] = [];
+    erro(e.message);
+  }
+  renderModulos();
+}
+
+/* Um jar ativo por sessao: trocar de jar recarrega o BLOB e reindexa. */
+async function abrirDaBase(codModulo, codJar) {
+  $('aviso').hidden = true;
+  mostrarProgresso(45, 'carregando jar da base...');
+  try {
+    var resposta = await chamar('abrir', { mod: codModulo, jar: codJar });
+    mostrarProgresso(100, 'indexando...');
+    esconderProgresso();
+    aplicarJar(resposta);
+    renderModulos();
+    avisoCfr();
+  } catch (e) {
+    esconderProgresso();
+    erro(e.message);
+  }
+}
+
 async function enviarJar(arquivo) {
   if (!/\.(jar|zip)$/i.test(arquivo.name)) { erro('Selecione um arquivo .jar.'); return; }
   $('aviso').hidden = true;
@@ -1144,6 +1685,7 @@ async function resetar() {
   $('tree-count').textContent = '';
   $('st-jar').textContent = 'nenhum jar carregado';
   limparCodigo();
+  if (S.modulos.length) renderModulos();
   setView('jar');
 }
 
@@ -1152,6 +1694,7 @@ function renderJarInfo() {
   $('jar-info').hidden = false;
   $('jar-info').innerHTML =
     '<div class="nm">' + esc(S.jar.nome) + '</div>' +
+    (S.jar.rotulo ? '<div class="orig">' + esc(S.jar.rotulo) + '</div>' : '') +
     '<dl>' +
       '<dt>Tamanho</dt><dd>' + fmtBytes(S.jar.tamanho) + '</dd>' +
       '<dt>Entradas</dt><dd>' + S.jar.entradas + '</dd>' +
@@ -1162,8 +1705,19 @@ function renderJarInfo() {
       '<button class="btn" id="btn-trocar">Trocar jar</button>' +
       '<button class="btn danger" id="btn-reset">Descartar</button>' +
     '</div>';
-  $('btn-trocar').onclick = function () { $('file').click(); };
+  $('btn-trocar').onclick = trocarJar;
   $('btn-reset').onclick = resetar;
+}
+
+/* Volta para a origem do jar aberto: base leva ao filtro, upload abre o seletor. */
+function trocarJar() {
+  if (S.jar && S.jar.codModulo) {
+    trocarOrigem('base');
+    $('q-mod').focus();
+    return;
+  }
+  trocarOrigem('upload');
+  $('file').click();
 }
 
 /* ---------------- arvore ---------------- */
@@ -1485,6 +2039,7 @@ function ligarResultados(achados) {
 
 /* ---------------- diagnostico ---------------- */
 function htmlDiagnostico(env) {
+  var banco = env.banco || {};
   var lista = '';
   for (var i = 0; i < env.cfr.candidatos.length; i++) {
     lista += '<li><code>' + esc(env.cfr.candidatos[i]) + '</code></li>';
@@ -1497,16 +2052,46 @@ function htmlDiagnostico(env) {
     '<p>Caminhos verificados, nesta ordem:</p><ul>' + lista + '</ul>' +
     '<p>Para apontar manualmente, suba o WildFly com ' +
     '<code>-Djvexplorer.cfr.jar=/caminho/cfr-0.152.jar</code>.</p>' +
+    '<h3>Modulos da base</h3>' +
+    '<pre>usuario SUP ' + (banco.sup ? 'sim' : 'nao') +
+    '\nautenticacao ' + esc(banco.auth || '?') +
+    '\nusuario     ' + esc(banco.usuario || '(nao identificado)') +
+    '\nconexao     ' + esc(banco.conexao || '(nao testada)') +
+    '\nsessao      ' + esc((banco.sessao || []).join('\n            ') || '(vazia)') + '</pre>' +
+    (banco.sup
+      ? '<p>Leitura de <code>TSIMOD</code> e <code>TSIJAR</code> liberada. Para forcar um DataSource, ' +
+        'suba o WildFly com <code>-Djvexplorer.ds=java:/jdbc/sankhyaDS</code>.</p>'
+      : '<p>' + esc(AVISO_SUP) + ' Se o usuario logado <b>e</b> SUP e ainda aparece ' +
+        '<code>nao</code>, o JSP nao conseguiu ler a identidade: <code>autenticacao</code> acima ' +
+        'mostra onde procurou e <code>sessao</code> lista o que existe na sessao HTTP.</p>') +
     '<h3>Ambiente</h3><pre>tmpdir      ' + esc(env.tmpdir) +
     '\nrota API    ' + esc(baseOk || '(indefinida)') +
     '\nlimite jar  ' + env.limites.jarMb + ' MB' +
     '\nlimite zip  ' + env.limites.explodidoMb + ' MB' +
     '\nmax entradas ' + env.limites.entradas + '</pre>' +
     '<h3>Como funciona</h3>' +
-    '<ul><li>O jar e enviado em blocos de 4 MB e gravado apenas no diretorio temporario da sessao.</li>' +
-    '<li>Nenhuma tabela do Sankhya e lida ou escrita.</li>' +
+    '<ul><li>O jar vem do cadastro de Modulos Java (somente leitura) ou de upload em blocos de 4 MB, ' +
+    'e e gravado apenas no diretorio temporario da sessao.</li>' +
+    '<li>Nenhuma tabela do Sankhya e escrita.</li>' +
+    '<li>Um jar ativo por sessao: escolher outro jar recarrega e reindexa.</li>' +
     '<li>As classes sao descompiladas sob demanda, ao clicar, e o resultado fica em cache na sessao.</li>' +
     '<li>Quando a sessao expira, o diretorio temporario e apagado e o processo recomeca do zero.</li></ul>';
+}
+
+function aplicarPermissao(env) {
+  var banco = env.banco || {};
+  S.sup = !!banco.sup;
+  $('seg-base').disabled = !S.sup;
+  $('seg-base').title = S.sup ? 'Jars cadastrados em Modulos Java (TSIMOD/TSIJAR)' : AVISO_SUP;
+  $('perm-aviso').hidden = S.sup;
+  if (S.sup) {
+    buscarModulos();
+    return;
+  }
+  $('perm-aviso').innerHTML = '<b>Acesso restrito</b>' + esc(AVISO_SUP) +
+    ' Voce esta como ' + esc(banco.usuario || 'usuario nao identificado') +
+    '; o upload manual do jar segue liberado.';
+  trocarOrigem('upload');
 }
 
 async function carregarEnv() {
@@ -1516,14 +2101,26 @@ async function carregarEnv() {
     S.env = env;
     $('dot-cfr').className = 'dot' + (S.cfr ? '' : ' off');
     $('btn-info').title = S.cfr ? 'CFR pronto: ' + env.cfr.caminho : 'CFR nao encontrado';
+    aplicarPermissao(env);
     avisoCfr();
   } catch (e) {
     $('dot-cfr').className = 'dot off';
+    aplicarPermissao({});
     mostrarAviso('<b>Sem comunicacao com o servidor</b>' + esc(e.message));
   }
 }
 
 /* ---------------- eventos ---------------- */
+function ligarOrigem() {
+  $('modlist').innerHTML = '<div class="empty">verificando acesso a base...</div>';
+  $('seg-base').onclick = function () { trocarOrigem('base'); };
+  $('seg-upload').onclick = function () { trocarOrigem('upload'); };
+  $('q-mod').addEventListener('input', agendarBuscaModulos);
+  $('q-mod').addEventListener('keydown', function (evento) {
+    if (evento.key === 'Enter') { clearTimeout(S.timerMod); buscarModulos(); }
+  });
+}
+
 function ligarDropzone() {
   var drop = $('drop');
   drop.onclick = function (evento) { if (evento.target.tagName !== 'LABEL') $('file').click(); };
@@ -1613,6 +2210,7 @@ function ocultarBarraSankhya() {
 function init() {
   ocultarBarraSankhya();
   ligarTema();
+  ligarOrigem();
   ligarDropzone();
   ligarBusca();
   ligarModal();
@@ -1653,7 +2251,8 @@ try {
             if (i > 0) sb.append(',');
             sb.append('"').append(escapeJson(candidatos.get(i))).append('"');
         }
-        sb.append("]},\"tmpdir\":\"").append(escapeJson(System.getProperty("java.io.tmpdir")))
+        sb.append("]},\"banco\":").append(jsonBanco(session))
+          .append(",\"tmpdir\":\"").append(escapeJson(System.getProperty("java.io.tmpdir")))
           .append("\",\"limites\":{\"jarMb\":").append(MAX_JAR / 1048576L)
           .append(",\"explodidoMb\":").append(MAX_EXPLODIDO / 1048576L)
           .append(",\"entradas\":").append(MAX_ENTRADAS).append("}}");
@@ -1664,6 +2263,19 @@ try {
         byte[] descarte = new byte[BUFFER];
         while (corpo.read(descarte) != -1) { /* consome e descarta */ }
         out.print("{\"success\":true,\"probe\":true}");
+
+    } else if ("modulos".equals(acao)) {
+        exigirSup(session);
+        out.print(jsonModulos(request.getParameter("q")));
+
+    } else if ("jars".equals(acao)) {
+        exigirSup(session);
+        out.print(jsonJars(inteiro(request.getParameter("mod"))));
+
+    } else if ("abrir".equals(acao)) {
+        exigirSup(session);
+        abrirDaBase(st, inteiro(request.getParameter("mod")), inteiro(request.getParameter("jar")));
+        out.print("{\"success\":true,\"jar\":" + jsonJar(st) + ",\"itens\":" + jsonItens(st) + "}");
 
     } else if ("reset".equals(acao)) {
         limpar(st);
@@ -1724,9 +2336,6 @@ try {
     }
 
 } catch (Throwable falha) {
-    Throwable raiz = falha.getCause() == null ? falha : falha.getCause();
-    String mensagem = raiz.getMessage();
-    out.print(jsonErro(mensagem == null || mensagem.length() == 0
-        ? raiz.getClass().getName() : mensagem));
+    out.print(jsonErro(descrever(falha.getCause() == null ? falha : falha.getCause())));
 }
 %>
