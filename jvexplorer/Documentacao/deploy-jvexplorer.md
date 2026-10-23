@@ -1,18 +1,22 @@
 # JVExplorer — dashboard HTML5
 
-Visualizador de fontes de arquivos `.jar` dentro do Sankhya OM. O usuário carrega
-um JAR, a tela descompila as classes sob demanda e permite navegar em pacotes e
-classes como num IDE. **Somente consulta**: nada é lido ou gravado em banco.
+Visualizador de fontes de arquivos `.jar` dentro do Sankhya OM. O JAR vem do
+cadastro de **Módulos Java** (`TSIMOD`/`TSIJAR`) ou de upload manual; a tela
+descompila as classes sob demanda e permite navegar em pacotes e classes como num
+IDE. **Somente consulta**: nada é gravado em banco.
 
 ## Comportamento
 
 | Aspecto | Como funciona |
 |---|---|
-| Persistência | Nenhuma. O JAR vai para `<java.io.tmpdir>/jvexplorer/<idSessao>/` |
+| Origem do JAR | Módulos Java da base (só SUP) ou upload manual |
+| Persistência | Nenhuma escrita. O JAR vai para `<java.io.tmpdir>/jvexplorer/<idSessao>/` |
+| JARs abertos | Um por sessão. Escolher outro JAR recarrega o BLOB e reindexa |
 | Ciclo de vida | Ao expirar/encerrar a sessão o diretório é apagado (`HttpSessionBindingListener`) e o processo recomeça |
 | Descompilação | CFR, sob demanda, ao clicar na classe; resultado em cache na sessão |
 | Fonte embutido | Se o JAR contém os `.java` (badge `src`), exibe o original em vez do bytecode reconstruído |
-| Banco de dados | Zero queries. Nenhum TSIBTA, TSIJAR ou serviço backend envolvido |
+| Banco de dados | Somente `SELECT` em `TSIMOD` e `TSIJAR`, com `PreparedStatement` e bind |
+| Permissão | Consulta à base restrita ao usuário **SUP** (`AuthenticationInfo.isSUP()`); upload liberado |
 
 Badges na árvore: `src` = fonte original do JAR · `dec` = reconstruído pelo CFR ·
 `arq` = recurso do JAR (xml, sql, properties, MANIFEST).
@@ -23,7 +27,10 @@ Padrão 4 (**JSP Unificado**): `main.jsp` serve a interface quando chamado sem
 parâmetros e responde JSON quando chamado com `?action=`.
 
 ```
-GET  ?action=env                                 -> diagnóstico (CFR, limites, tmpdir)
+GET  ?action=env                                 -> diagnóstico (CFR, banco, limites, tmpdir)
+GET  ?action=modulos&q=<termo>                   -> módulos java da base (SUP)
+GET  ?action=jars&mod=<codModulo>                -> jars do módulo (SUP)
+GET  ?action=abrir&mod=<cod>&jar=<cod>           -> carrega o BLOB, extrai e indexa (SUP)
 POST ?action=probe                               -> fixa a rota que aceita POST
 POST ?action=upload&nome=&chunk=N&final=0|1      -> bloco binário de 4 MB
 GET  ?action=source&path=<path do índice>        -> fonte (embutido ou descompilado)
@@ -34,6 +41,18 @@ Não existe módulo Java importado nem botão de ação. Classes de Módulo Java
 ficam num classloader filho, invisível ao JSP — por isso o CFR é carregado por um
 `URLClassLoader` isolado sobre o JAR em `lib/`, invocado por reflection
 (`org.benf.cfr.reader.api.CfrDriver`, com fallback para `Main.main`).
+
+O acesso ao banco também é por reflection, e por um motivo diferente: um `import`
+de classe Sankhya que não resolva impede a **compilação do JSP** e derruba a tela
+inteira, inclusive o upload. A ordem de resolução da conexão é:
+
+1. `-Djvexplorer.ds=<jndi>`, quando informado — vai direto ao `DataSource`
+2. JAPE: `JapeSession.open()` → `EntityFacadeFactory.getDWFFacade().getJdbcWrapper()`
+   → `openSession()` / `getConnection()`, fechando com `closeSession()` e `JapeSession.close(handle)`
+3. `DataSource` por JNDI, nos nomes usuais (`java:/jdbc/sankhyaDS`, `java:jboss/datasources/SankhyaDS`, …)
+
+O dialeto sai de `DatabaseMetaData.getDatabaseProductName()`: o tamanho do BLOB usa
+`DBMS_LOB.GETLENGTH` no Oracle e `DATALENGTH` no SQL Server.
 
 O upload vai em blocos de 4 MB porque o `max-post-size` padrão do WildFly é 10 MB.
 
@@ -93,6 +112,7 @@ Detalhes da ordem de resolução: `jvexplorer/Dashboards/html5/jvexplorer/lib/RE
 | Conteúdo extraído | 512 MB | proteção contra zip bomb |
 | Entradas no JAR | 60.000 | proteção contra zip bomb |
 | Cache de fontes | 400 arquivos por sessão | limita memória da sessão |
+| JARs abertos | 1 por sessão | teto de disco temporário por sessão |
 | Bloco de upload | 4 MB | abaixo do `max-post-size` padrão |
 
 Outras proteções:
@@ -101,6 +121,10 @@ Outras proteções:
 - Zip-slip bloqueado: entradas absolutas ou com `../` são descartadas
 - `action=source` só aceita paths presentes no índice da sessão — o cliente nunca
   monta um `File` no servidor
+- `modulos`, `jars` e `abrir` exigem SUP no servidor: esconder o filtro no cliente
+  é só cosmético
+- Termo de busca vai por bind com `%` e `_` escapados (`ESCAPE ''`); nenhum SQL
+  é montado por concatenação
 - Classes internas (`Outer$Inner.class`) não aparecem na árvore: saem no fonte da
   classe externa, como num IDE
 
@@ -111,5 +135,8 @@ Outras proteções:
 | `Nenhuma rota aceita POST neste ambiente` | `html5component.mge` recusa POST e o caminho direto do JSP está bloqueado por filtro. Verifique a rota mostrada em Diagnóstico |
 | `HTTP 413` no upload | `max-post-size` do http-listener abaixo de 4 MB |
 | `Descompilador não encontrado` | Ver seção do CFR acima |
+| Aba **Módulos da base** desabilitada | Usuário não é SUP, ou `AuthenticationInfo` não chegou à thread do JSP. Veja `usuario SUP` em Diagnóstico |
+| `Sem conexao com o banco` | Nem JAPE nem os nomes JNDI resolveram. Informe `-Djvexplorer.ds=<jndi>` e confira `conexao` em Diagnóstico |
+| `O jar esta cadastrado sem conteudo` | `TSIJAR.ARQUIVO` nulo para aquele registro |
 | `O CFR não produziu fonte para esta classe` | Bytecode corrompido ou ofuscado; a classe é a única afetada |
 | Acentos trocados no fonte | Fonte não é UTF-8 nem ISO-8859-1. A leitura tenta UTF-8 estrito e cai para ISO-8859-1 |

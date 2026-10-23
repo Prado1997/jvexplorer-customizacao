@@ -3,7 +3,7 @@ plugins {
     id 'org.jetbrains.kotlin.jvm' version '1.9.22'
 }
 group = 'br.com.sankhya.dstech'
-def skwVersion = "4.36"
+def skwVersion = "4.35"
 
 // Vamos forçar o java 8 aqui
 java {
@@ -43,7 +43,10 @@ dependencies {
     implementation 'com.squareup.okhttp3:okhttp:3.9.0'
     implementation 'org.json:json:20210307'
     compileOnly 'javax.ejb:ejb-api:3.0'
-    compileOnly 'javax.servlet:servlet-api:2.3'
+    // Servlet/JSP na versao do WildFly do OM. Sem a jsp-api a IDE nao resolve os
+    // objetos implicitos do main.jsp (request, session, out, application).
+    compileOnly 'javax.servlet:javax.servlet-api:3.1.0'
+    compileOnly 'javax.servlet.jsp:javax.servlet.jsp-api:2.3.3'
 
     implementation "br.com.sankhya:jape:$skwVersion"
     implementation "br.com.sankhya:mge-modelcore:$skwVersion"
