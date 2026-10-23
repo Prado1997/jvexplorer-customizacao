@@ -1942,7 +1942,8 @@ var S = {
   cache: {},
   abas: [],
   ativo: null,
-  colapsados: {},
+  abertos: {},
+  revelar: null,
   busca: '',
   cfr: false,
   sup: false,
@@ -2270,7 +2271,7 @@ function aplicarJar(resposta) {
   S.cache = {};
   S.abas = [];
   S.ativo = null;
-  S.colapsados = {};
+  S.abertos = abrirCadeiaUnica(montarArvore(S.itens));
   S.busca = '';
   for (var i = 0; i < S.itens.length; i++) S.indice[S.itens[i].path] = S.itens[i];
   $('q').value = '';
@@ -2398,7 +2399,7 @@ function linhaItem(item, nivel) {
 }
 
 function linhaPacote(no, nivel, id) {
-  var fechado = S.colapsados[id] ? ' collapsed' : '';
+  var fechado = S.abertos[id] ? '' : ' collapsed';
   return '<button class="node pkg' + fechado + '" data-pkg="' + esc(id) + '"' +
     ' style="padding-left:' + (8 + nivel * 13) + 'px">' +
     '<span class="tw">&#9662;</span><span class="ic">' + iconePasta + '</span>' +
@@ -2415,6 +2416,26 @@ function ordenar(no) {
   return chaves;
 }
 
+/* Pacotes nascem fechados. O id junta nomes comprimidos com '.', entao volta a '/'
+   para saber se o arquivo aberto fora da arvore (busca, analise) esta dentro dele. */
+function contemRevelado(id) {
+  return Boolean(S.revelar) && S.revelar.indexOf(id.substring(1).replace(/\./g, '/') + '/') === 0;
+}
+
+/* Abre so a cadeia de pacote unico do topo (br.com.empresa): o usuario ja ve os
+   pacotes reais fechados, em vez de uma raiz solitaria que exige um clique. */
+function abrirCadeiaUnica(raiz) {
+  var abertos = {};
+  var no = raiz;
+  var prefixo = '';
+  while (no.ordem.length === 1 && !no.filhos[no.ordem[0]].item) {
+    no = no.filhos[no.ordem[0]];
+    prefixo += '/' + no.nome;
+    abertos[prefixo] = true;
+  }
+  return abertos;
+}
+
 function caminhar(no, nivel, prefixo, linhas) {
   var chaves = ordenar(no);
   for (var i = 0; i < chaves.length; i++) {
@@ -2424,8 +2445,9 @@ function caminhar(no, nivel, prefixo, linhas) {
       linhas.push(linhaItem(filho.item, nivel));
       continue;
     }
+    if (contemRevelado(id)) S.abertos[id] = true;
     linhas.push(linhaPacote(filho, nivel, id));
-    if (!S.colapsados[id]) caminhar(filho, nivel + 1, id, linhas);
+    if (S.abertos[id]) caminhar(filho, nivel + 1, id, linhas);
   }
 }
 
@@ -2438,6 +2460,7 @@ function renderArvore() {
   }
   var linhas = [];
   caminhar(montarArvore(S.itens), 0, '', linhas);
+  S.revelar = null;
   $('tree-title').textContent = 'Estrutura';
   $('tree-count').textContent = S.itens.length;
   $('tree').innerHTML = linhas.join('');
@@ -2453,7 +2476,7 @@ function ligarArvore() {
   for (var p = 0; p < pacotes.length; p++) {
     pacotes[p].onclick = function () {
       var id = this.dataset.pkg;
-      if (S.colapsados[id]) delete S.colapsados[id]; else S.colapsados[id] = true;
+      if (S.abertos[id]) delete S.abertos[id]; else S.abertos[id] = true;
       renderArvore();
     };
   }
@@ -2466,6 +2489,7 @@ async function abrirArquivo(path, focar) {
   if (S.abas.indexOf(path) < 0) S.abas.push(path);
   if (S.abas.length > MAX_ABAS) S.abas.shift();
   S.ativo = path;
+  S.revelar = path;
   renderAbas();
   if (!S.busca) renderArvore();
   if (focar !== false) setView('code');
