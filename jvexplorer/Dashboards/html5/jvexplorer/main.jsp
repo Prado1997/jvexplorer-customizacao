@@ -525,6 +525,34 @@ private static void abrirDaBase(Estado estado, int codModulo, int codJar) throws
     indexar(estado, extrairTudo(estado));
 }
 
+/* ------------------------------------------------------------- download */
+
+/* filename so aceita ASCII sem aspas; o nome original segue em filename* (RFC 5987). */
+private static String dispositionDe(String nome) throws UnsupportedEncodingException {
+    String base = nome == null || nome.length() == 0 ? "arquivo.jar" : nome;
+    String ascii = base.replaceAll("[^A-Za-z0-9._-]", "_");
+    String codificado = URLEncoder.encode(base, "UTF-8").replace("+", "%20");
+    return "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + codificado;
+}
+
+/* Entrega so o jar ja carregado na sessao: a permissao foi checada ao abrir. */
+private static void enviarJar(Estado estado, HttpServletResponse resposta) throws IOException {
+    resposta.setContentType("application/java-archive");
+    resposta.setHeader("Content-Disposition", dispositionDe(estado.nomeJar));
+    resposta.setHeader("Content-Length", String.valueOf(estado.jar.length()));
+    resposta.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    InputStream in = new BufferedInputStream(new FileInputStream(estado.jar));
+    OutputStream saida = resposta.getOutputStream();
+    try {
+        byte[] buf = new byte[BUFFER];
+        int lidos;
+        while ((lidos = in.read(buf)) != -1) saida.write(buf, 0, lidos);
+        saida.flush();
+    } finally {
+        in.close();
+    }
+}
+
 /* --------------------------------------------------------------- upload */
 
 private static void anexar(File destino, InputStream in, long jaGravado) throws IOException {
@@ -1040,7 +1068,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .jarcard dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:9px 0 0;font-size:11.5px}
 .jarcard dt{color:var(--ink-3)}
 .jarcard dd{margin:0;color:var(--ink-2);font-family:"JetBrains Mono",monospace;text-align:right}
-.jarcard .acoes{display:flex;gap:7px;margin-top:11px}
+.jarcard .acoes{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}
 
 .prog{margin-top:12px}
 .prog .bar{height:5px;border-radius:3px;background:var(--surface-2);overflow:hidden}
@@ -1703,10 +1731,22 @@ function renderJarInfo() {
     '</dl>' +
     '<div class="acoes">' +
       '<button class="btn" id="btn-trocar">Trocar jar</button>' +
+      '<button class="btn" id="btn-baixar">Baixar jar</button>' +
       '<button class="btn danger" id="btn-reset">Descartar</button>' +
     '</div>';
   $('btn-trocar').onclick = trocarJar;
+  $('btn-baixar').onclick = baixarJar;
   $('btn-reset').onclick = resetar;
+}
+
+/* Link nativo: o navegador baixa em stream, sem carregar o jar na memoria do JS. */
+function baixarJar() {
+  var link = document.createElement('a');
+  link.href = montarUrl(baseOk || API_BASES[0], 'download');
+  link.download = S.jar.nome;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 /* Volta para a origem do jar aberto: base leva ao filtro, upload abre o seletor. */
@@ -2229,6 +2269,20 @@ init();
 </body>
 </html>
 <%
+    return;
+}
+
+/* Binario: resolvido antes do content-type JSON. pushBody isola o JspWriter,
+   senao o flush final do JSP colide com getOutputStream(). */
+if ("download".equals(acao)) {
+    Estado atual = estado(session);
+    if (!atual.jar.isFile()) {
+        response.sendError(HttpServletResponse.SC_NOT_FOUND, "Nenhum jar carregado nesta sessao.");
+        return;
+    }
+    out.clear();
+    out = pageContext.pushBody();
+    enviarJar(atual, response);
     return;
 }
 
