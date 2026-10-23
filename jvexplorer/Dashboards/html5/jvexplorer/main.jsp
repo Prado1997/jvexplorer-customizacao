@@ -1557,6 +1557,14 @@ function trocarOrigem(origem) {
   $('seg-upload').classList.toggle('on', origem === 'upload');
   $('origem-base').hidden = origem !== 'base';
   $('drop').hidden = origem !== 'upload';
+  sincronizarCardJar();
+}
+
+/* O card pertence a aba de onde o jar veio: na outra aba ele nao aparece. */
+function sincronizarCardJar() {
+  var visivel = Boolean(S.jar) && (S.jar.codModulo ? 'base' : 'upload') === S.origem;
+  $('jar-info').hidden = !visivel;
+  $('jar-count').textContent = visivel ? S.jar.classes : '';
 }
 
 function agendarBuscaModulos() {
@@ -1718,8 +1726,7 @@ async function resetar() {
 }
 
 function renderJarInfo() {
-  $('jar-count').textContent = S.jar.classes;
-  $('jar-info').hidden = false;
+  sincronizarCardJar();
   $('jar-info').innerHTML =
     '<div class="nm">' + esc(S.jar.nome) + '</div>' +
     (S.jar.rotulo ? '<div class="orig">' + esc(S.jar.rotulo) + '</div>' : '') +
@@ -1731,18 +1738,21 @@ function renderJarInfo() {
     '</dl>' +
     htmlAcoesJar(Boolean(S.jar.codModulo));
   if ($('btn-trocar')) $('btn-trocar').onclick = trocarJar;
-  $('btn-baixar').onclick = baixarJar;
+  if ($('btn-baixar')) $('btn-baixar').onclick = baixarJar;
   $('btn-reset').onclick = resetar;
 }
 
-/* Jar da base e so consulta: troca-se pela lista de modulos, entao o card so baixa ou fecha. */
+/* Baixar so faz sentido para o jar da base: o de upload o usuario ja tem localmente. */
 function htmlAcoesJar(daBase) {
+  if (daBase) {
+    return '<div class="acoes">' +
+      '<button class="btn" id="btn-baixar">Baixar jar</button>' +
+      '<button class="btn" id="btn-reset">Fechar</button>' +
+    '</div>';
+  }
   return '<div class="acoes">' +
-    (daBase ? '' : '<button class="btn" id="btn-trocar">Trocar jar</button>') +
-    '<button class="btn" id="btn-baixar">Baixar jar</button>' +
-    (daBase
-      ? '<button class="btn" id="btn-reset">Fechar</button>'
-      : '<button class="btn danger" id="btn-reset">Descartar</button>') +
+    '<button class="btn" id="btn-trocar">Trocar jar</button>' +
+    '<button class="btn danger" id="btn-reset">Descartar</button>' +
   '</div>';
 }
 
