@@ -1729,14 +1729,21 @@ function renderJarInfo() {
       '<dt>Classes</dt><dd>' + S.jar.classes + '</dd>' +
       '<dt>Navegaveis</dt><dd>' + S.jar.itens + '</dd>' +
     '</dl>' +
-    '<div class="acoes">' +
-      '<button class="btn" id="btn-trocar">Trocar jar</button>' +
-      '<button class="btn" id="btn-baixar">Baixar jar</button>' +
-      '<button class="btn danger" id="btn-reset">Descartar</button>' +
-    '</div>';
-  $('btn-trocar').onclick = trocarJar;
+    htmlAcoesJar(Boolean(S.jar.codModulo));
+  if ($('btn-trocar')) $('btn-trocar').onclick = trocarJar;
   $('btn-baixar').onclick = baixarJar;
   $('btn-reset').onclick = resetar;
+}
+
+/* Jar da base e so consulta: troca-se pela lista de modulos, entao o card so baixa ou fecha. */
+function htmlAcoesJar(daBase) {
+  return '<div class="acoes">' +
+    (daBase ? '' : '<button class="btn" id="btn-trocar">Trocar jar</button>') +
+    '<button class="btn" id="btn-baixar">Baixar jar</button>' +
+    (daBase
+      ? '<button class="btn" id="btn-reset">Fechar</button>'
+      : '<button class="btn danger" id="btn-reset">Descartar</button>') +
+  '</div>';
 }
 
 /* Link nativo: o navegador baixa em stream, sem carregar o jar na memoria do JS. */
@@ -1749,13 +1756,8 @@ function baixarJar() {
   link.remove();
 }
 
-/* Volta para a origem do jar aberto: base leva ao filtro, upload abre o seletor. */
+/* So existe no card de upload: reabre o seletor de arquivo. */
 function trocarJar() {
-  if (S.jar && S.jar.codModulo) {
-    trocarOrigem('base');
-    $('q-mod').focus();
-    return;
-  }
   trocarOrigem('upload');
   $('file').click();
 }
