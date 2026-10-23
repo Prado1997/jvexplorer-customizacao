@@ -6,6 +6,7 @@
 <%@ page import="java.sql.*"%>
 <%@ page import="java.util.*"%>
 <%@ page import="java.util.jar.*"%>
+<%@ page import="java.util.regex.*"%>
 <%@ page import="javax.naming.*"%>
 <%@ page import="javax.servlet.*"%>
 <%@ page import="javax.servlet.http.*"%>
@@ -62,6 +63,7 @@ public static final class Estado implements HttpSessionBindingListener {
     int qtdClasses;
     int qtdEntradas;
     int seq;
+    String analise;
     final Map<String, No> indice = new LinkedHashMap<String, No>();
     final Map<String, String> cache = new HashMap<String, String>();
 
@@ -170,6 +172,7 @@ private static void limpar(Estado estado) {
     apagar(estado.parcial);
     estado.indice.clear();
     estado.cache.clear();
+    estado.analise = null;
     estado.nomeJar = "";
     estado.rotulo = "";
     estado.codModulo = 0;
@@ -805,6 +808,455 @@ private static String descompilar(Estado estado, No no, File cfrJar) throws Exce
     return lerTexto(gerado);
 }
 
+/* --------------------------------------------------------------- analise */
+
+/* Analise estatica: o classfile e lido direto, sem carregar nem descompilar.
+   Nada do jar executa e dependencias ausentes nao impedem a leitura. */
+private static final int MAGICO_CLASSE = 0xCAFEBABE;
+private static final int CP_UTF8 = 1, CP_INT = 3, CP_FLOAT = 4, CP_LONG = 5, CP_DOUBLE = 6,
+    CP_CLASSE = 7, CP_STRING = 8, CP_CAMPO = 9, CP_METODO = 10, CP_METODO_IF = 11,
+    CP_NOME_TIPO = 12, CP_HANDLE = 15, CP_TIPO_METODO = 16, CP_DINAMICO = 17,
+    CP_INVOKEDYNAMIC = 18, CP_MODULO = 19, CP_PACOTE = 20;
+private static final int ACC_PUBLIC = 0x0001, ACC_SYNTHETIC = 0x1000;
+private static final int MAX_LISTA = 20;
+private static final int MAX_HERANCA = 10;
+private static final int MIN_ENTIDADE = 5;
+private static final String PAPEL_APOIO = "Apoio";
+
+/* Papel pelo nome simples: o pacote da API muda entre versoes do Sankhya. */
+private static final Map<String, String> PAPEIS = new HashMap<String, String>();
+static {
+    PAPEIS.put("EventoProgramavelJava", "Evento programavel");
+    PAPEIS.put("AcaoRotinaJava", "Botao de acao");
+    PAPEIS.put("ScheduledAction", "Acao agendada");
+    PAPEIS.put("RegraNegocioJava", "Regra de negocio");
+    PAPEIS.put("ActionButton", "Botao de acao (addon)");
+    PAPEIS.put("Listener", "Listener (addon)");
+    PAPEIS.put("Job", "Job (addon)");
+    PAPEIS.put("BusinessRule", "Regra de negocio (addon)");
+    PAPEIS.put("Callback", "Callback (addon)");
+    PAPEIS.put("SessionBean", "EJB");
+    PAPEIS.put("Stateless", "EJB");
+    PAPEIS.put("Stateful", "EJB");
+}
+
+private static final String[] DONOS_DADOS = { "br/com/sankhya/jape/", "java/sql/" };
+private static final Set<String> API_ESCRITA = new HashSet<String>(Arrays.asList(
+    "create", "createEntity", "prepareToUpdate", "prepareToUpdateByPK", "update", "save",
+    "delete", "deleteByCriteria", "removeEntity", "executeUpdate", "saveOrUpdateEntity"));
+private static final Set<String> API_LEITURA = new HashSet<String>(Arrays.asList(
+    "find", "findByPK", "findOne", "findEntityByPrimaryKey", "findByDynamicFinder",
+    "findByDynamicFinderAsVO", "executeQuery"));
+
+/* Tabelas so no padrao Sankhya (T??/V?? + AD_): evita ler "update dos itens" como tabela. */
+private static final String RE_TABELA = "((?:AD_\\w+)|(?:[TV][A-Z]{2}\\w{2,}))";
+private static final Pattern RE_LEITURA = Pattern.compile(
+    "(?i)(?<!DELETE\\s)\\b(?:FROM|JOIN)\\s+" + RE_TABELA);
+private static final Pattern RE_ESCRITA = Pattern.compile(
+    "(?i)\\b(?:INSERT\\s+INTO|UPDATE|DELETE\\s+FROM|MERGE\\s+INTO)\\s+" + RE_TABELA);
+/* "from X" solto aparece em textos de ajuda: leitura so conta se a classe tem SELECT. */
+private static final Pattern RE_SELECT = Pattern.compile("(?i)\\bSELECT\\b");
+private static final Pattern RE_ENTIDADE = Pattern.compile("^(?:[A-Z][a-z0-9]+){1,6}$|^AD[A-Z0-9]{3,}$");
+private static final Set<String> NAO_TABELA = new HashSet<String>(Arrays.asList(
+    "TABLE", "TEMP", "TEMPORARY", "TRIGGER", "VALUES"));
+
+public static final class Pool {
+    int[] tag;
+    int[] a;
+    int[] b;
+    String[] utf;
+
+    String utf(int i) { return i > 0 && i < utf.length && utf[i] != null ? utf[i] : ""; }
+    String classe(int i) { return utf(a[i]); }
+    String membro(int i) { return classe(a[i]) + "#" + utf(a[b[i]]); }
+}
+
+public static final class InfoClasse {
+    String nome = "";
+    String superClasse = "";
+    final List<String> interfaces = new ArrayList<String>();
+    final Set<String> metodos = new LinkedHashSet<String>();
+    final Set<String> classes = new LinkedHashSet<String>();
+    final Set<String> descritores = new HashSet<String>();
+    final Set<String> chamadas = new HashSet<String>();
+    final List<String> textos = new ArrayList<String>();
+}
+
+public static final class Coleta {
+    final Map<String, InfoClasse> classes = new TreeMap<String, InfoClasse>();
+    int falhas;
+}
+
+public static final class Ficha {
+    String path;
+    String papel;
+    InfoClasse info;
+    boolean gravaApi;
+    boolean leApi;
+    final Set<String> leitura = new TreeSet<String>();
+    final Set<String> escrita = new TreeSet<String>();
+    final Set<String> entidades = new TreeSet<String>();
+    final Set<String> apis = new TreeSet<String>();
+    final Set<String> dependencias = new TreeSet<String>();
+}
+
+/* skipBytes pode pular menos que o pedido: insiste ate o fim ou acusa truncamento. */
+private static void pular(DataInputStream in, int bytes) throws IOException {
+    int faltam = bytes;
+    while (faltam > 0) {
+        int pulados = in.skipBytes(faltam);
+        if (pulados <= 0) throw new EOFException("Classfile truncado.");
+        faltam -= pulados;
+    }
+}
+
+private static void lerEntrada(DataInputStream in, Pool pool, int i, int tag) throws IOException {
+    switch (tag) {
+        case CP_UTF8: pool.utf[i] = in.readUTF(); break;
+        case CP_INT: case CP_FLOAT: pular(in, 4); break;
+        case CP_HANDLE: pular(in, 3); break;
+        case CP_CLASSE: case CP_STRING: case CP_TIPO_METODO: case CP_MODULO: case CP_PACOTE:
+            pool.a[i] = in.readUnsignedShort(); break;
+        case CP_CAMPO: case CP_METODO: case CP_METODO_IF: case CP_NOME_TIPO:
+        case CP_DINAMICO: case CP_INVOKEDYNAMIC:
+            pool.a[i] = in.readUnsignedShort();
+            pool.b[i] = in.readUnsignedShort();
+            break;
+        default: throw new IOException("Tag de constant pool desconhecida: " + tag);
+    }
+}
+
+private static Pool lerPool(DataInputStream in) throws IOException {
+    int total = in.readUnsignedShort();
+    Pool pool = new Pool();
+    pool.tag = new int[total];
+    pool.a = new int[total];
+    pool.b = new int[total];
+    pool.utf = new String[total];
+    for (int i = 1; i < total; i++) {
+        int tag = in.readUnsignedByte();
+        pool.tag[i] = tag;
+        if (tag != CP_LONG && tag != CP_DOUBLE) {
+            lerEntrada(in, pool, i, tag);
+            continue;
+        }
+        pular(in, 8);
+        i++; // long e double ocupam duas posicoes do pool
+    }
+    return pool;
+}
+
+private static void pularAtributos(DataInputStream in) throws IOException {
+    int qtd = in.readUnsignedShort();
+    for (int i = 0; i < qtd; i++) {
+        pular(in, 2);
+        pular(in, in.readInt());
+    }
+}
+
+private static void pularCampos(DataInputStream in) throws IOException {
+    int qtd = in.readUnsignedShort();
+    for (int i = 0; i < qtd; i++) {
+        pular(in, 6);
+        pularAtributos(in);
+    }
+}
+
+private static void lerMetodos(DataInputStream in, Pool pool, InfoClasse info) throws IOException {
+    int qtd = in.readUnsignedShort();
+    for (int i = 0; i < qtd; i++) {
+        int acesso = in.readUnsignedShort();
+        String nome = pool.utf(in.readUnsignedShort());
+        pular(in, 2);
+        pularAtributos(in);
+        boolean publico = (acesso & ACC_PUBLIC) != 0 && (acesso & ACC_SYNTHETIC) == 0;
+        if (publico && !nome.startsWith("<") && !nome.startsWith("lambda$")) info.metodos.add(nome);
+    }
+}
+
+private static void extrairPool(Pool pool, InfoClasse info) {
+    for (int i = 1; i < pool.tag.length; i++) {
+        int tag = pool.tag[i];
+        if (tag == CP_CLASSE) info.classes.add(pool.classe(i));
+        else if (tag == CP_STRING) info.textos.add(pool.utf(pool.a[i]));
+        else if (tag == CP_METODO || tag == CP_METODO_IF) info.chamadas.add(pool.membro(i));
+        else if (tag == CP_UTF8 && pool.utf[i].startsWith("L") && pool.utf[i].endsWith(";")) {
+            info.descritores.add(pool.utf[i].substring(1, pool.utf[i].length() - 1));
+        }
+    }
+}
+
+private static InfoClasse lerClasse(File arquivo) throws IOException {
+    DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(arquivo)));
+    try {
+        if (in.readInt() != MAGICO_CLASSE) throw new IOException("Classfile invalido: " + arquivo.getName());
+        pular(in, 4); // minor + major
+        Pool pool = lerPool(in);
+        InfoClasse info = new InfoClasse();
+        pular(in, 2); // access flags
+        info.nome = pool.classe(in.readUnsignedShort());
+        int indiceSuper = in.readUnsignedShort();
+        info.superClasse = indiceSuper == 0 ? "" : pool.classe(indiceSuper);
+        int qtd = in.readUnsignedShort();
+        for (int i = 0; i < qtd; i++) info.interfaces.add(pool.classe(in.readUnsignedShort()));
+        pularCampos(in);
+        lerMetodos(in, pool, info);
+        extrairPool(pool, info);
+        return info;
+    } finally {
+        in.close();
+    }
+}
+
+/* Classes internas ($) somam na externa: o SQL de um callback anonimo e da classe dona. */
+private static void incorporar(InfoClasse acumulado, InfoClasse lida, boolean principal) {
+    if (principal) {
+        acumulado.nome = lida.nome;
+        acumulado.superClasse = lida.superClasse;
+        acumulado.interfaces.addAll(lida.interfaces);
+        acumulado.metodos.addAll(lida.metodos);
+    }
+    acumulado.classes.addAll(lida.classes);
+    acumulado.descritores.addAll(lida.descritores);
+    acumulado.chamadas.addAll(lida.chamadas);
+    acumulado.textos.addAll(lida.textos);
+}
+
+private static String simplesDe(String nomeInterno) {
+    String nome = nomeInterno.substring(nomeInterno.lastIndexOf('/') + 1);
+    return nome.substring(nome.lastIndexOf('$') + 1);
+}
+
+private static String pathDe(String nomeInterno) {
+    int inicioNome = nomeInterno.lastIndexOf('/') + 1;
+    int cifrao = nomeInterno.indexOf('$', inicioNome);
+    return (cifrao < 0 ? nomeInterno : nomeInterno.substring(0, cifrao)) + ".java";
+}
+
+private static void incorporarArquivo(File arquivo, String rel, Coleta coleta) {
+    String semExtensao = rel.substring(0, rel.length() - ".class".length());
+    String path = pathDe(semExtensao);
+    InfoClasse lida;
+    try {
+        lida = lerClasse(arquivo);
+    } catch (Exception ilegivel) {
+        coleta.falhas++;
+        return;
+    }
+    InfoClasse acumulado = coleta.classes.get(path);
+    if (acumulado == null) {
+        acumulado = new InfoClasse();
+        coleta.classes.put(path, acumulado);
+    }
+    incorporar(acumulado, lida, semExtensao.indexOf('$', semExtensao.lastIndexOf('/') + 1) < 0);
+}
+
+private static void coletarClasses(File dir, String prefixo, Coleta coleta) {
+    File[] filhos = dir.listFiles();
+    if (filhos == null) return;
+    for (File filho : filhos) {
+        String rel = prefixo + filho.getName();
+        if (filho.isDirectory()) coletarClasses(filho, rel + "/", coleta);
+        else if (rel.endsWith(".class") && !rel.startsWith("META-INF/")) incorporarArquivo(filho, rel, coleta);
+    }
+}
+
+private static String papelDireto(InfoClasse info) {
+    List<String> tipos = new ArrayList<String>(info.interfaces);
+    tipos.add(info.superClasse);
+    tipos.addAll(info.descritores);
+    for (String tipo : tipos) {
+        String papel = PAPEIS.get(simplesDe(tipo));
+        if (papel != null) return papel;
+    }
+    return null;
+}
+
+/* Sobe a heranca dentro do jar: uma base abstrata pode ser quem implementa a interface Sankhya. */
+private static String papelDe(InfoClasse info, Coleta coleta) {
+    InfoClasse atual = info;
+    for (int nivel = 0; atual != null && nivel < MAX_HERANCA; nivel++) {
+        String papel = papelDireto(atual);
+        if (papel != null) return papel;
+        atual = atual.superClasse.length() == 0 ? null : coleta.classes.get(pathDe(atual.superClasse));
+    }
+    return PAPEL_APOIO;
+}
+
+private static void tabelas(Pattern re, String sql, Set<String> destino) {
+    Matcher achado = re.matcher(sql);
+    while (achado.find()) {
+        String tabela = achado.group(1).toUpperCase(Locale.ENGLISH);
+        if (!NAO_TABELA.contains(tabela)) destino.add(tabela);
+    }
+}
+
+private static boolean ehDonoDeDados(String dono) {
+    for (String prefixo : DONOS_DADOS) {
+        if (dono.startsWith(prefixo)) return true;
+    }
+    return false;
+}
+
+private static void classificarChamadas(InfoClasse info, Ficha ficha) {
+    for (String chamada : info.chamadas) {
+        int corte = chamada.indexOf('#');
+        if (!ehDonoDeDados(chamada.substring(0, corte))) continue;
+        String metodo = chamada.substring(corte + 1);
+        if (API_ESCRITA.contains(metodo)) ficha.gravaApi = true;
+        else if (API_LEITURA.contains(metodo)) ficha.leApi = true;
+    }
+}
+
+private static void classificarReferencias(InfoClasse info, Coleta coleta, Ficha ficha) {
+    for (String nome : info.classes) {
+        if (nome.startsWith("[")) continue;
+        String path = pathDe(nome);
+        if (coleta.classes.containsKey(path)) {
+            if (!path.equals(ficha.path)) ficha.dependencias.add(path);
+        } else if (nome.startsWith("br/com/sankhya/") || nome.startsWith("com/sankhya/")) {
+            ficha.apis.add(simplesDe(nome));
+        }
+    }
+}
+
+/* Nomes de entidade costumam ser constantes inlinadas pelo javac: so da para inferir pelo literal. */
+private static void entidadesProvaveis(InfoClasse info, Ficha ficha) {
+    boolean usaJape = false;
+    for (String nome : info.classes) usaJape |= nome.startsWith("br/com/sankhya/jape/");
+    if (!usaJape) return;
+    for (String texto : info.textos) {
+        if (texto.length() >= MIN_ENTIDADE && RE_ENTIDADE.matcher(texto).matches()) ficha.entidades.add(texto);
+    }
+}
+
+private static String juntar(List<String> textos) {
+    StringBuilder sb = new StringBuilder(256);
+    for (String texto : textos) sb.append(texto).append(' ');
+    return sb.toString();
+}
+
+private static Ficha montarFicha(String path, InfoClasse info, Coleta coleta) {
+    Ficha ficha = new Ficha();
+    ficha.path = path;
+    ficha.info = info;
+    ficha.papel = papelDe(info, coleta);
+    String sql = juntar(info.textos);
+    tabelas(RE_ESCRITA, sql, ficha.escrita);
+    if (RE_SELECT.matcher(sql).find()) tabelas(RE_LEITURA, sql, ficha.leitura);
+    classificarChamadas(info, ficha);
+    classificarReferencias(info, coleta, ficha);
+    entidadesProvaveis(info, ficha);
+    return ficha;
+}
+
+/* Pontos de entrada (eventos, botoes, jobs) primeiro; classes de apoio por ultimo. */
+private static final Comparator<Ficha> ORDEM_FICHA = new Comparator<Ficha>() {
+    public int compare(Ficha x, Ficha y) {
+        boolean apoioX = PAPEL_APOIO.equals(x.papel);
+        boolean apoioY = PAPEL_APOIO.equals(y.papel);
+        if (apoioX != apoioY) return apoioX ? 1 : -1;
+        int porPapel = x.papel.compareTo(y.papel);
+        return porPapel != 0 ? porPapel : x.path.compareTo(y.path);
+    }
+};
+
+private static String jsonLista(Collection<String> itens) {
+    StringBuilder sb = new StringBuilder(64).append('[');
+    int i = 0;
+    for (String item : itens) {
+        if (i == MAX_LISTA) {
+            sb.append(",\"+").append(itens.size() - MAX_LISTA).append('"');
+            break;
+        }
+        if (i++ > 0) sb.append(',');
+        sb.append('"').append(escapeJson(item.replace('/', '.'))).append('"');
+    }
+    return sb.append(']').toString();
+}
+
+private static void jsonFicha(StringBuilder sb, Ficha ficha) {
+    List<String> dependencias = new ArrayList<String>();
+    for (String path : ficha.dependencias) dependencias.add(path.substring(0, path.length() - ".java".length()));
+    sb.append("{\"path\":\"").append(escapeJson(ficha.path))
+      .append("\",\"papel\":\"").append(escapeJson(ficha.papel))
+      .append("\",\"super\":\"").append(escapeJson(ficha.info.superClasse.replace('/', '.')))
+      .append("\",\"gravaApi\":").append(ficha.gravaApi)
+      .append(",\"leApi\":").append(ficha.leApi)
+      .append(",\"interfaces\":").append(jsonLista(ficha.info.interfaces))
+      .append(",\"leitura\":").append(jsonLista(ficha.leitura))
+      .append(",\"escrita\":").append(jsonLista(ficha.escrita))
+      .append(",\"entidades\":").append(jsonLista(ficha.entidades))
+      .append(",\"apis\":").append(jsonLista(ficha.apis))
+      .append(",\"metodos\":").append(jsonLista(ficha.info.metodos))
+      .append(",\"dependencias\":").append(jsonLista(dependencias))
+      .append('}');
+}
+
+private static void somarTabelas(Map<String, int[]> totais, Set<String> tabelas, int coluna) {
+    for (String tabela : tabelas) {
+        int[] contagem = totais.get(tabela);
+        if (contagem == null) totais.put(tabela, contagem = new int[2]);
+        contagem[coluna]++;
+    }
+}
+
+private static String jsonResumo(List<Ficha> fichas, Coleta coleta) {
+    Map<String, Integer> papeis = new TreeMap<String, Integer>();
+    Map<String, int[]> tabelas = new TreeMap<String, int[]>();
+    for (Ficha ficha : fichas) {
+        Integer qtd = papeis.get(ficha.papel);
+        papeis.put(ficha.papel, qtd == null ? 1 : qtd + 1);
+        somarTabelas(tabelas, ficha.leitura, 0);
+        somarTabelas(tabelas, ficha.escrita, 1);
+    }
+    StringBuilder sb = new StringBuilder(512).append("{\"classes\":").append(fichas.size())
+        .append(",\"falhas\":").append(coleta.falhas).append(",\"papeis\":{");
+    int i = 0;
+    for (Map.Entry<String, Integer> papel : papeis.entrySet()) {
+        if (i++ > 0) sb.append(',');
+        sb.append('"').append(escapeJson(papel.getKey())).append("\":").append(papel.getValue());
+    }
+    return sb.append("},\"tabelas\":").append(jsonTabelas(tabelas)).append('}').toString();
+}
+
+private static String jsonTabelas(Map<String, int[]> tabelas) {
+    StringBuilder sb = new StringBuilder(256).append('[');
+    int i = 0;
+    for (Map.Entry<String, int[]> tabela : tabelas.entrySet()) {
+        if (i++ > 0) sb.append(',');
+        sb.append("{\"nome\":\"").append(escapeJson(tabela.getKey()))
+          .append("\",\"leitura\":").append(tabela.getValue()[0])
+          .append(",\"escrita\":").append(tabela.getValue()[1]).append('}');
+    }
+    return sb.append(']').toString();
+}
+
+private static boolean ehMetadado(String path) {
+    return path.endsWith("module-info.java") || path.endsWith("package-info.java");
+}
+
+/* Cacheada na sessao: o jar nao muda ate ser trocado, e limpar() descarta a analise. */
+private static String jsonAnalise(Estado estado) throws IOException {
+    if (estado.analise != null) return estado.analise;
+    if (!estado.jar.isFile()) throw new IOException("Nenhum jar carregado nesta sessao.");
+    Coleta coleta = new Coleta();
+    coletarClasses(estado.classes, "", coleta);
+    List<Ficha> fichas = new ArrayList<Ficha>();
+    for (Map.Entry<String, InfoClasse> classe : coleta.classes.entrySet()) {
+        if (!ehMetadado(classe.getKey())) fichas.add(montarFicha(classe.getKey(), classe.getValue(), coleta));
+    }
+    Collections.sort(fichas, ORDEM_FICHA);
+    StringBuilder sb = new StringBuilder(fichas.size() * 256 + 256);
+    sb.append("{\"success\":true,\"resumo\":").append(jsonResumo(fichas, coleta)).append(",\"classes\":[");
+    for (int i = 0; i < fichas.size(); i++) {
+        if (i > 0) sb.append(',');
+        jsonFicha(sb, fichas.get(i));
+    }
+    estado.analise = sb.append("]}").toString();
+    return estado.analise;
+}
+
 /* ------------------------------------------------------------------ JSON */
 
 private static String jsonItens(Estado estado) {
@@ -1224,6 +1676,39 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
 }
 .modal-body code{font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--accent-ink)}
 
+/* ---------- analise do jar ---------- */
+.modal.largo{max-width:960px}
+.modal-head .seg{margin:0;flex:none}
+.modal-head .segb{flex:none;padding:5px 12px}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.pill{
+  display:inline-flex;align-items:center;gap:5px;flex:none;padding:2px 8px;border-radius:999px;
+  border:1px solid var(--line);background:var(--surface-2);font-size:11.5px;color:var(--ink-2);white-space:nowrap;
+}
+.pill b{color:var(--ink)}
+.pill.forte{border-color:var(--accent);background:var(--accent-wash);color:var(--accent-ink)}
+.tabwrap{overflow-x:auto;margin:0 0 10px}
+.tab-analise{width:100%;border-collapse:collapse;font-size:12px}
+.tab-analise th,.tab-analise td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line-soft)}
+.tab-analise th{color:var(--ink-3);font-weight:500}
+.tab-analise td+td,.tab-analise th+th{text-align:right;font-family:"JetBrains Mono",monospace}
+.pkg-analise{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;background:var(--surface-2)}
+.pkg-analise > summary{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;min-width:0}
+.pkg-analise > summary code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+.pkg-analise[open] > summary{border-bottom:1px solid var(--line-soft)}
+.pkg-classes{padding:8px 8px 2px}
+.cls-analise{border:1px solid var(--line-soft);border-radius:8px;margin-bottom:6px;background:var(--ground)}
+.cls-analise summary{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;min-width:0}
+.cls-analise summary code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
+.cls-analise summary code b{color:var(--ink)}
+.cls-analise[open] summary{border-bottom:1px solid var(--line-soft)}
+.cls-analise > p{margin:10px 12px;color:var(--ink)}
+.cls-analise .btn{margin:0 12px 12px}
+.ficha{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 12px 12px;font-size:12px}
+.ficha dt{color:var(--ink-3)}
+.ficha dd{margin:0;color:var(--ink);word-break:break-word;font-family:"JetBrains Mono",monospace;font-size:11.5px}
+.mais{color:var(--ink-3)}
+
 /* ---------- responsivo ---------- */
 .back{display:none}
 @media (max-width:1080px){ .panes{grid-template-columns:240px 250px 1fr} }
@@ -1237,6 +1722,8 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
   .app[data-view="jar"] .pane:not(.p-jar){display:none}
   .app[data-view="tree"] .pane:not(.p-tree){display:none}
   .app[data-view="code"] .pane:not(.p-code){display:none}
+  .modal-head{flex-wrap:wrap}
+  .ficha{grid-template-columns:1fr}
   .back{display:inline-flex;align-items:center;gap:5px}
   .brand span{display:none}
   .kbd{display:none}
@@ -1345,9 +1832,10 @@ mark{background:var(--accent-wash);color:var(--accent-ink);border-radius:2px;pad
 </div>
 
 <div class="overlay" id="overlay" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle">
+  <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle">
     <div class="modal-head">
-      <h2 id="mtitle">Diagnostico do JVExplorer</h2>
+      <h2 id="mtitle">Diagnostico</h2>
+      <div class="seg" id="modal-abas"></div>
       <button class="btn" id="btn-close">Fechar</button>
     </div>
     <div class="modal-body" id="modal-body"></div>
@@ -1380,7 +1868,8 @@ var S = {
   modulos: [],
   jars: {},
   modAberto: null,
-  timerMod: null
+  timerMod: null,
+  analise: null
 };
 
 var $ = function (id) { return document.getElementById(id); };
@@ -1693,6 +2182,7 @@ async function enviarJar(arquivo) {
 
 function aplicarJar(resposta) {
   S.jar = resposta.jar;
+  S.analise = null;
   S.itens = resposta.itens;
   S.indice = {};
   S.cache = {};
@@ -1712,7 +2202,7 @@ function aplicarJar(resposta) {
 
 async function resetar() {
   try { await chamar('reset'); } catch (e) { /* sessao ja limpa */ }
-  S.jar = null; S.itens = []; S.indice = {}; S.cache = {};
+  S.jar = null; S.analise = null; S.itens = []; S.indice = {}; S.cache = {};
   S.abas = []; S.ativo = null; S.busca = '';
   $('q').value = ''; $('q').disabled = true;
   $('jar-info').hidden = true;
@@ -2239,12 +2729,176 @@ function ligarTema() {
   };
 }
 
+/* Com jar aberto o Diagnostico abre na analise; sem jar so o ambiente faz sentido. */
+function abrirDiagnostico() {
+  $('overlay').hidden = false;
+  mostrarAbaModal(S.jar ? 'analise' : 'ambiente');
+}
+
+function mostrarAbaModal(aba) {
+  $('modal').classList.toggle('largo', aba === 'analise');
+  $('modal-abas').innerHTML =
+    '<button class="segb' + (aba === 'analise' ? ' on' : '') + '" type="button" id="aba-analise"' +
+      (S.jar ? '' : ' disabled title="Abra um jar para analisar"') + '>Analise do jar</button>' +
+    '<button class="segb' + (aba === 'ambiente' ? ' on' : '') + '" type="button" id="aba-ambiente">Ambiente</button>';
+  $('aba-analise').onclick = function () { mostrarAbaModal('analise'); };
+  $('aba-ambiente').onclick = function () { mostrarAbaModal('ambiente'); };
+  if (aba === 'analise') { carregarAnalise(); return; }
+  $('modal-body').innerHTML = S.env ? htmlDiagnostico(S.env)
+    : '<p>Diagnostico indisponivel: o servidor nao respondeu.</p>';
+}
+
+/* ---------------- analise do jar ---------------- */
+var MAX_ANALISE = 300;
+
+/* Frases montadas so com fatos lidos do bytecode, nada e inferido alem disso. */
+var PAPEL_FRASE = {
+  'Evento programavel': 'Evento programavel: reage a inclusao, alteracao ou exclusao de registros.',
+  'Botao de acao': 'Botao de acao: executa uma rotina sob demanda a partir de uma tela.',
+  'Acao agendada': 'Acao agendada: executada periodicamente pelo agendador do Sankhya.',
+  'Regra de negocio': 'Regra de negocio: valida ou complementa operacoes do sistema.',
+  'Botao de acao (addon)': 'Botao de acao do Addon Studio: executa uma rotina sob demanda a partir de uma tela.',
+  'Listener (addon)': 'Listener do Addon Studio: reage a eventos de persistencia de uma entidade.',
+  'Job (addon)': 'Job do Addon Studio: executado periodicamente pelo agendador.',
+  'Regra de negocio (addon)': 'Regra de negocio do Addon Studio: valida ou complementa operacoes do sistema.',
+  'Callback (addon)': 'Callback do Addon Studio: chamado pelo sistema em um ponto especifico do fluxo.',
+  'EJB': 'EJB: servico de backend publicado no servidor de aplicacao.'
+};
+
+async function carregarAnalise() {
+  if (S.analise) { renderAnalise(); return; }
+  var jar = S.jar;
+  $('modal-body').innerHTML = '<div class="empty">Analisando as classes do jar...</div>';
+  try {
+    var dados = await chamar('analise');
+    if (S.jar !== jar) return;
+    S.analise = dados;
+    if (!$('overlay').hidden && $('aba-analise').classList.contains('on')) renderAnalise();
+  } catch (e) {
+    $('modal-body').innerHTML = '<p>Falha na analise: ' + esc(e.message) + '</p>';
+  }
+}
+
+function renderAnalise() {
+  $('modal-body').innerHTML = htmlResumoAnalise(S.analise.resumo) +
+    '<h3>Classes</h3>' +
+    '<div class="minisearch"><input id="q-analise" type="search" autocomplete="off" spellcheck="false"' +
+    ' placeholder="Filtrar por classe, papel, tabela ou entidade..."></div>' +
+    '<div id="lista-analise"></div>';
+  $('q-analise').addEventListener('input', function (e) { renderListaAnalise(e.target.value.trim()); });
+  renderListaAnalise('');
+}
+
+function htmlResumoAnalise(r) {
+  var papeis = Object.keys(r.papeis).map(function (p) {
+    return '<span class="pill' + (p === 'Apoio' ? '' : ' forte') + '">' + esc(p) + ' <b>' + r.papeis[p] + '</b></span>';
+  }).join('');
+  return '<h3>Resumo</h3>' +
+    '<p>' + r.classes + ' classes analisadas' + (r.falhas ? ', ' + r.falhas + ' arquivo(s) .class ilegivel(is)' : '') +
+    '. Leitura direta do bytecode, sem executar nada: papel vem da heranca e das anotacoes; ' +
+    'tabelas e entidades sao inferidas dos textos SQL e literais da classe.</p>' +
+    '<div class="pills">' + papeis + '</div>' +
+    htmlTabelasAnalise(r.tabelas);
+}
+
+function htmlTabelasAnalise(tabelas) {
+  if (!tabelas.length) return '<p>Nenhuma tabela identificada em SQL literal.</p>';
+  var linhas = tabelas.map(function (t) {
+    return '<tr><td><code>' + esc(t.nome) + '</code></td><td>' + t.leitura + '</td><td>' + t.escrita + '</td></tr>';
+  }).join('');
+  return '<h3>Tabelas citadas</h3><div class="tabwrap"><table class="tab-analise"><thead><tr>' +
+    '<th>Tabela</th><th>Classes que leem</th><th>Classes que gravam</th></tr></thead>' +
+    '<tbody>' + linhas + '</tbody></table></div>';
+}
+
+function textoBuscaClasse(c) {
+  return [c.path, c.papel].concat(c.leitura, c.escrita, c.entidades).join(' ').toLowerCase();
+}
+
+function renderListaAnalise(termo) {
+  var t = termo.toLowerCase();
+  var achados = S.analise.classes.filter(function (c) { return !t || textoBuscaClasse(c).indexOf(t) >= 0; });
+  // Ordena por pacote antes do corte para o limite nao deixar pacotes pela metade.
+  achados.sort(function (a, b) { return pacoteDe(a.path).localeCompare(pacoteDe(b.path)); });
+  var grupos = agruparPorPacote(achados.slice(0, MAX_ANALISE));
+  var aberto = Boolean(t) || grupos.length === 1;
+  var html = grupos.map(function (g) { return htmlPacoteAnalise(g, aberto); }).join('');
+  if (achados.length > MAX_ANALISE) {
+    html += '<p class="mais">Exibindo ' + MAX_ANALISE + ' de ' + achados.length + ' classes. Refine o filtro.</p>';
+  }
+  $('lista-analise').innerHTML = html || '<div class="empty">Nenhuma classe corresponde ao filtro.</div>';
+  ligarListaAnalise();
+}
+
+function pacoteDe(path) {
+  var corte = path.lastIndexOf('/');
+  return corte < 0 ? '(pacote padrao)' : path.substring(0, corte).replace(/\//g, '.');
+}
+
+/* Pacotes em ordem alfabetica; dentro de cada um vale a ordem do servidor (entradas primeiro). */
+function agruparPorPacote(classes) {
+  var grupos = {};
+  classes.forEach(function (c) {
+    var pacote = pacoteDe(c.path);
+    (grupos[pacote] = grupos[pacote] || []).push(c);
+  });
+  return Object.keys(grupos).sort(function (a, b) { return a.localeCompare(b); }).map(function (p) { return { nome: p, classes: grupos[p] }; });
+}
+
+function htmlPacoteAnalise(grupo, aberto) {
+  var entradas = grupo.classes.filter(function (c) { return c.papel !== 'Apoio'; }).length;
+  return '<details class="pkg-analise"' + (aberto ? ' open' : '') + '><summary>' +
+      '<code>' + esc(grupo.nome) + '</code>' +
+      (entradas ? '<span class="pill forte">' + entradas + ' entrada(s)</span>' : '') +
+      '<span class="pill">' + grupo.classes.length + ' classe(s)</span></summary>' +
+    '<div class="pkg-classes">' + grupo.classes.map(htmlClasseAnalise).join('') + '</div>' +
+  '</details>';
+}
+
+function linhaFicha(rotulo, itens) {
+  if (!itens || !itens.length) return '';
+  return '<dt>' + rotulo + '</dt><dd>' + itens.map(esc).join(', ') + '</dd>';
+}
+
+function htmlClasseAnalise(c) {
+  var herda = c.super && c.super !== 'java.lang.Object' ? [c.super] : [];
+  return '<details class="cls-analise"><summary>' +
+      '<span class="pill' + (c.papel === 'Apoio' ? '' : ' forte') + '">' + esc(c.papel) + '</span>' +
+      '<code><b>' + esc(nomeArq(c.path).replace(/\.[^.]+$/, '')) + '</b></code></summary>' +
+    '<p>' + esc(descreverClasse(c)) + '</p>' +
+    '<dl class="ficha">' +
+      linhaFicha('Herda de', herda) + linhaFicha('Implementa', c.interfaces) +
+      linhaFicha('Le', c.leitura) + linhaFicha('Grava', c.escrita) +
+      linhaFicha('Entidades provaveis', c.entidades) + linhaFicha('APIs Sankhya', c.apis) +
+      linhaFicha('Metodos publicos', c.metodos) + linhaFicha('Usa do jar', c.dependencias) +
+    '</dl>' +
+    '<button class="btn" type="button" data-path="' + esc(c.path) + '">Abrir codigo</button>' +
+  '</details>';
+}
+
+function descreverClasse(c) {
+  var partes = [PAPEL_FRASE[c.papel] || 'Classe de apoio, usada por outras classes do jar.'];
+  if (c.leitura.length) partes.push('Consulta ' + c.leitura.join(', ') + '.');
+  else if (c.leApi) partes.push('Le dados via API JAPE/JDBC.');
+  if (c.escrita.length) partes.push('Grava em ' + c.escrita.join(', ') + '.');
+  else if (c.gravaApi) partes.push('Grava dados via API JAPE/JDBC.');
+  if (c.entidades.length) partes.push('Provavelmente opera as entidades ' + c.entidades.join(', ') + '.');
+  if (c.dependencias.length) partes.push('Depende de ' + c.dependencias.length + ' classe(s) do proprio jar.');
+  return partes.join(' ');
+}
+
+function ligarListaAnalise() {
+  var botoes = $('lista-analise').querySelectorAll('button[data-path]');
+  for (var i = 0; i < botoes.length; i++) {
+    botoes[i].onclick = function () {
+      $('overlay').hidden = true;
+      abrirArquivo(this.dataset.path);
+    };
+  }
+}
+
 function ligarModal() {
-  $('btn-info').onclick = function () {
-    $('modal-body').innerHTML = S.env ? htmlDiagnostico(S.env)
-      : '<p>Diagnostico indisponivel: o servidor nao respondeu.</p>';
-    $('overlay').hidden = false;
-  };
+  $('btn-info').onclick = abrirDiagnostico;
   $('btn-close').onclick = function () { $('overlay').hidden = true; };
   $('overlay').onclick = function (e) { if (e.target === $('overlay')) $('overlay').hidden = true; };
 }
@@ -2342,6 +2996,9 @@ try {
         exigirSup(session);
         abrirDaBase(st, inteiro(request.getParameter("mod")), inteiro(request.getParameter("jar")));
         out.print("{\"success\":true,\"jar\":" + jsonJar(st) + ",\"itens\":" + jsonItens(st) + "}");
+
+    } else if ("analise".equals(acao)) {
+        out.print(jsonAnalise(st));
 
     } else if ("reset".equals(acao)) {
         limpar(st);
